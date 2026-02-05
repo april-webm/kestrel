@@ -191,6 +191,6 @@ If Kestrel is used in academic research, citation is appreciated:
   author = {Kidd, April},
   url = {https://github.com/april-webm/kestrel},
   version = {0.1.0},
-  year = {2024}
+  year = {2026}
 }
 ```

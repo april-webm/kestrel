@@ -35,3 +35,6 @@ Thumbs.db
 *.log
 .env
 .claude
+
+# Lock files (not needed for libraries)
+uv.lock

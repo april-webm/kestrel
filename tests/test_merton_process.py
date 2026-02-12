@@ -85,11 +85,11 @@ def test_merton_process_fit_mle(sample_merton_data):
     assert merton.is_fitted
     assert hasattr(merton, 'mu_')
     assert hasattr(merton, 'sigma_')
-    assert hasattr(merton, 'lambda__')  # Double underscore for lambda_
+    assert hasattr(merton, 'lambda_')
     assert hasattr(merton, 'jump_mu_')
     assert hasattr(merton, 'jump_sigma_')
     assert merton.sigma_ > 0
-    assert merton.lambda__ > 0
+    assert merton.lambda_ > 0
     assert merton.jump_sigma_ > 0
 
 

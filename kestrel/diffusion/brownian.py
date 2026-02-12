@@ -1,10 +1,15 @@
 # kestrel/diffusion/brownian.py
 """Brownian motion and Geometric Brownian Motion implementations."""
 
+from __future__ import annotations
+
+from typing import Dict, Optional
+
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
+
 from kestrel.base import StochasticProcess
+from kestrel.utils.fisher_information import bm_fisher_information, gbm_fisher_information
 from kestrel.utils.kestrel_result import KestrelResult
 
 
@@ -22,12 +27,21 @@ class BrownianMotion(StochasticProcess):
         Volatility (diffusion coefficient).
     """
 
-    def __init__(self, mu: float = None, sigma: float = None):
+    mu: Optional[float]
+    sigma: Optional[float]
+
+    def __init__(self, mu: Optional[float] = None, sigma: Optional[float] = None) -> None:
         super().__init__()
         self.mu = mu
         self.sigma = sigma
 
-    def fit(self, data: pd.Series, dt: float = None, method: str = 'mle'):
+    def fit(
+        self,
+        data: pd.Series,
+        dt: Optional[float] = None,
+        method: str = 'mle',
+        regularization: Optional[float] = None,
+    ) -> None:
         """
         Estimates (mu, sigma) from time-series data.
 
@@ -39,6 +53,10 @@ class BrownianMotion(StochasticProcess):
             Time step between observations.
         method : str
             Estimation method: 'mle' or 'moments'.
+        regularization : float, optional
+            L2 penalty strength on drift parameter mu. When set, the estimator
+            becomes the MAP estimate under a Gaussian prior. Closed-form Ridge
+            solution is used (no optimizer needed).
 
         Raises
         ------
@@ -54,7 +72,7 @@ class BrownianMotion(StochasticProcess):
         self.dt_ = dt
 
         if method == 'mle':
-            param_ses = self._fit_mle(data, dt)
+            param_ses = self._fit_mle(data, dt, regularization=regularization)
         elif method == 'moments':
             param_ses = self._fit_moments(data, dt)
         else:
@@ -68,34 +86,7 @@ class BrownianMotion(StochasticProcess):
             param_ses=param_ses
         )
 
-    def _infer_dt(self, data: pd.Series) -> float:
-        """Infers dt from DatetimeIndex or defaults to 1.0."""
-        if isinstance(data.index, pd.DatetimeIndex):
-            if len(data.index) < 2:
-                return 1.0
-
-            inferred_timedelta = data.index[1] - data.index[0]
-            current_freq = pd.infer_freq(data.index)
-            if current_freq is None:
-                current_freq = 'B'
-
-            if current_freq in ['B', 'C', 'D']:
-                dt = inferred_timedelta / pd.Timedelta(days=252.0)
-            elif current_freq.startswith('W'):
-                dt = inferred_timedelta / pd.Timedelta(weeks=52)
-            elif current_freq in ['M', 'MS', 'BM', 'BMS']:
-                dt = inferred_timedelta / pd.Timedelta(days=365 / 12)
-            elif current_freq in ['Q', 'QS', 'BQ', 'BQS']:
-                dt = inferred_timedelta / pd.Timedelta(days=365 / 4)
-            elif current_freq in ['A', 'AS', 'BA', 'BAS', 'Y', 'YS', 'BY', 'BYS']:
-                dt = inferred_timedelta / pd.Timedelta(days=365)
-            else:
-                dt = inferred_timedelta.total_seconds() / (365 * 24 * 3600)
-
-            return max(dt, 1e-10)
-        return 1.0
-
-    def _fit_mle(self, data: pd.Series, dt: float) -> dict:
+    def _fit_mle(self, data: pd.Series, dt: float, regularization: Optional[float] = None) -> Dict[str, float]:
         """Estimates parameters using Maximum Likelihood."""
         if len(data) < 2:
             raise ValueError("MLE estimation requires at least 2 data points.")
@@ -104,17 +95,22 @@ class BrownianMotion(StochasticProcess):
         dx = np.diff(x)
         n = len(dx)
 
-        # MLE estimates for Brownian motion
-        self.mu = np.mean(dx) / dt
-        self.sigma = np.std(dx, ddof=1) / np.sqrt(dt)
+        # Sigma estimate (unaffected by regularization on mu)
+        self.sigma = float(np.sqrt(np.var(dx, ddof=1) / dt))
 
-        # Standard errors
-        se_mu = self.sigma / np.sqrt(n * dt)
-        se_sigma = self.sigma / np.sqrt(2 * n)
+        # MLE / Ridge estimate for mu
+        if regularization is not None and regularization > 0:
+            # Penalised MLE: argmin_mu sum((dx_i - mu*dt)^2)/(2*sigma^2*dt) + lambda*mu^2
+            # Closed-form: mu = sum(dx) / (n*dt + 2*lambda*sigma^2*dt)
+            self.mu = float(np.sum(dx) / (n * dt + 2 * regularization * self.sigma ** 2 * dt))
+        else:
+            self.mu = float(np.mean(dx) / dt)
 
-        return {'mu': se_mu, 'sigma': se_sigma}
+        # Standard errors from Fisher Information
+        self._fisher_information_, param_ses = bm_fisher_information(self.sigma, dt, n)
+        return param_ses
 
-    def _fit_moments(self, data: pd.Series, dt: float) -> dict:
+    def _fit_moments(self, data: pd.Series, dt: float) -> Dict[str, float]:
         """Estimates parameters using method of moments."""
         if len(data) < 2:
             raise ValueError("Moments estimation requires at least 2 data points.")
@@ -124,18 +120,16 @@ class BrownianMotion(StochasticProcess):
         n = len(dx)
 
         # First moment: E[dX] = mu * dt
-        self.mu = np.mean(dx) / dt
+        self.mu = float(np.mean(dx) / dt)
 
         # Second moment: Var[dX] = sigma^2 * dt
-        self.sigma = np.sqrt(np.var(dx, ddof=1) / dt)
+        self.sigma = float(np.sqrt(np.var(dx, ddof=1) / dt))
 
-        # Standard errors (approximate)
-        se_mu = self.sigma / np.sqrt(n * dt)
-        se_sigma = self.sigma / np.sqrt(2 * n)
+        # Standard errors from Fisher Information
+        self._fisher_information_, param_ses = bm_fisher_information(self.sigma, dt, n)
+        return param_ses
 
-        return {'mu': se_mu, 'sigma': se_sigma}
-
-    def sample(self, n_paths: int = 1, horizon: int = 1, dt: float = None) -> KestrelResult:
+    def sample(self, n_paths: int = 1, horizon: int = 1, dt: Optional[float] = None) -> KestrelResult:
         """
         Simulates future Brownian motion paths.
 
@@ -197,12 +191,21 @@ class GeometricBrownianMotion(StochasticProcess):
         Volatility.
     """
 
-    def __init__(self, mu: float = None, sigma: float = None):
+    mu: Optional[float]
+    sigma: Optional[float]
+
+    def __init__(self, mu: Optional[float] = None, sigma: Optional[float] = None) -> None:
         super().__init__()
         self.mu = mu
         self.sigma = sigma
 
-    def fit(self, data: pd.Series, dt: float = None, method: str = 'mle'):
+    def fit(
+        self,
+        data: pd.Series,
+        dt: Optional[float] = None,
+        method: str = 'mle',
+        regularization: Optional[float] = None,
+    ) -> None:
         """
         Estimates (mu, sigma) from price time-series.
 
@@ -214,6 +217,9 @@ class GeometricBrownianMotion(StochasticProcess):
             Time step between observations.
         method : str
             Estimation method: 'mle' only currently supported.
+        regularization : float, optional
+            L2 penalty strength on drift parameter mu. Closed-form Ridge
+            solution in log-return space.
 
         Raises
         ------
@@ -232,7 +238,7 @@ class GeometricBrownianMotion(StochasticProcess):
         self.dt_ = dt
 
         if method == 'mle':
-            param_ses = self._fit_mle(data, dt)
+            param_ses = self._fit_mle(data, dt, regularization=regularization)
         else:
             raise ValueError(f"Unknown estimation method: {method}. Choose 'mle'.")
 
@@ -244,34 +250,7 @@ class GeometricBrownianMotion(StochasticProcess):
             param_ses=param_ses
         )
 
-    def _infer_dt(self, data: pd.Series) -> float:
-        """Infers dt from DatetimeIndex or defaults to 1.0."""
-        if isinstance(data.index, pd.DatetimeIndex):
-            if len(data.index) < 2:
-                return 1.0
-
-            inferred_timedelta = data.index[1] - data.index[0]
-            current_freq = pd.infer_freq(data.index)
-            if current_freq is None:
-                current_freq = 'B'
-
-            if current_freq in ['B', 'C', 'D']:
-                dt = inferred_timedelta / pd.Timedelta(days=252.0)
-            elif current_freq.startswith('W'):
-                dt = inferred_timedelta / pd.Timedelta(weeks=52)
-            elif current_freq in ['M', 'MS', 'BM', 'BMS']:
-                dt = inferred_timedelta / pd.Timedelta(days=365 / 12)
-            elif current_freq in ['Q', 'QS', 'BQ', 'BQS']:
-                dt = inferred_timedelta / pd.Timedelta(days=365 / 4)
-            elif current_freq in ['A', 'AS', 'BA', 'BAS', 'Y', 'YS', 'BY', 'BYS']:
-                dt = inferred_timedelta / pd.Timedelta(days=365)
-            else:
-                dt = inferred_timedelta.total_seconds() / (365 * 24 * 3600)
-
-            return max(dt, 1e-10)
-        return 1.0
-
-    def _fit_mle(self, data: pd.Series, dt: float) -> dict:
+    def _fit_mle(self, data: pd.Series, dt: float, regularization: Optional[float] = None) -> Dict[str, float]:
         """Estimates parameters using Maximum Likelihood on log-returns."""
         if len(data) < 2:
             raise ValueError("MLE estimation requires at least 2 data points.")
@@ -284,20 +263,22 @@ class GeometricBrownianMotion(StochasticProcess):
         mean_r = np.mean(log_returns)
         var_r = np.var(log_returns, ddof=1)
 
-        # Estimate sigma from variance
-        self.sigma = np.sqrt(var_r / dt)
+        # Estimate sigma from variance (unaffected by regularization)
+        self.sigma = float(np.sqrt(var_r / dt))
 
-        # Estimate mu from mean and sigma
-        # mean_r = (mu - 0.5*sigma^2) * dt => mu = mean_r/dt + 0.5*sigma^2
-        self.mu = mean_r / dt + 0.5 * self.sigma ** 2
+        # Estimate mu
+        if regularization is not None and regularization > 0:
+            # Ridge on alpha = mu - 0.5*sigma^2 in log-return space
+            alpha_penalized = float(np.sum(log_returns) / (n * dt + 2 * regularization * self.sigma ** 2 * dt))
+            self.mu = float(alpha_penalized + 0.5 * self.sigma ** 2)
+        else:
+            self.mu = float(mean_r / dt + 0.5 * self.sigma ** 2)
 
-        # Standard errors
-        se_sigma = self.sigma / np.sqrt(2 * n)
-        se_mu = np.sqrt((self.sigma ** 2 / (n * dt)) + (se_sigma ** 2))
+        # Standard errors from Fisher Information
+        self._fisher_information_, param_ses = gbm_fisher_information(self.mu, self.sigma, dt, n)
+        return param_ses
 
-        return {'mu': se_mu, 'sigma': se_sigma}
-
-    def sample(self, n_paths: int = 1, horizon: int = 1, dt: float = None) -> KestrelResult:
+    def sample(self, n_paths: int = 1, horizon: int = 1, dt: Optional[float] = None) -> KestrelResult:
         """
         Simulates future GBM price paths.
 
@@ -342,7 +323,7 @@ class GeometricBrownianMotion(StochasticProcess):
 
         return KestrelResult(pd.DataFrame(paths), initial_value=initial_val)
 
-    def expected_price(self, t: float, s0: float = None) -> float:
+    def expected_price(self, t: float, s0: Optional[float] = None) -> float:
         """
         Computes expected price at time t.
 
@@ -370,9 +351,9 @@ class GeometricBrownianMotion(StochasticProcess):
             else:
                 raise ValueError("Initial price s0 must be provided.")
 
-        return s0 * np.exp(mu * t)
+        return float(s0 * np.exp(mu * t))
 
-    def variance_price(self, t: float, s0: float = None) -> float:
+    def variance_price(self, t: float, s0: Optional[float] = None) -> float:
         """
         Computes variance of price at time t.
 
@@ -401,4 +382,4 @@ class GeometricBrownianMotion(StochasticProcess):
             else:
                 raise ValueError("Initial price s0 must be provided.")
 
-        return (s0 ** 2) * np.exp(2 * mu * t) * (np.exp(sigma ** 2 * t) - 1)
+        return float((s0 ** 2) * np.exp(2 * mu * t) * (np.exp(sigma ** 2 * t) - 1))

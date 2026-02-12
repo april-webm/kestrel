@@ -42,7 +42,7 @@ class MertonProcess(StochasticProcess):
         self.jump_mu = jump_mu
         self.jump_sigma = jump_sigma
 
-    def fit(self, data: pd.Series, dt: float = None, method: str = 'mle'):
+    def fit(self, data: pd.Series, dt: float = None, method: str = 'mle', regularization: float = None):
         """
         Estimates parameters from log-return time-series data.
 
@@ -54,6 +54,8 @@ class MertonProcess(StochasticProcess):
             Time step between observations.
         method : str
             Estimation method: 'mle' only currently supported.
+        regularization : float, optional
+            L2 penalty strength on drift parameter mu.
 
         Raises
         ------
@@ -69,7 +71,7 @@ class MertonProcess(StochasticProcess):
         self.dt_ = dt
 
         if method == 'mle':
-            param_ses = self._fit_mle(data, dt)
+            param_ses = self._fit_mle(data, dt, regularization=regularization)
         else:
             raise ValueError(f"Unknown estimation method: {method}. Choose 'mle'.")
 
@@ -84,34 +86,7 @@ class MertonProcess(StochasticProcess):
             param_ses=param_ses
         )
 
-    def _infer_dt(self, data: pd.Series) -> float:
-        """Infers dt from DatetimeIndex or defaults to 1.0."""
-        if isinstance(data.index, pd.DatetimeIndex):
-            if len(data.index) < 2:
-                return 1.0
-
-            inferred_timedelta = data.index[1] - data.index[0]
-            current_freq = pd.infer_freq(data.index)
-            if current_freq is None:
-                current_freq = 'B'
-
-            if current_freq in ['B', 'C', 'D']:
-                dt = inferred_timedelta / pd.Timedelta(days=252.0)
-            elif current_freq.startswith('W'):
-                dt = inferred_timedelta / pd.Timedelta(weeks=52)
-            elif current_freq in ['M', 'MS', 'BM', 'BMS']:
-                dt = inferred_timedelta / pd.Timedelta(days=365 / 12)
-            elif current_freq in ['Q', 'QS', 'BQ', 'BQS']:
-                dt = inferred_timedelta / pd.Timedelta(days=365 / 4)
-            elif current_freq in ['A', 'AS', 'BA', 'BAS', 'Y', 'YS', 'BY', 'BYS']:
-                dt = inferred_timedelta / pd.Timedelta(days=365)
-            else:
-                dt = inferred_timedelta.total_seconds() / (365 * 24 * 3600)
-
-            return max(dt, 1e-10)
-        return 1.0
-
-    def _fit_mle(self, data: pd.Series, dt: float) -> dict:
+    def _fit_mle(self, data: pd.Series, dt: float, regularization: float = None) -> dict:
         """
         Estimates Merton parameters using Maximum Likelihood.
 
@@ -157,10 +132,12 @@ class MertonProcess(StochasticProcess):
             (1e-6, None)       # jump_sigma
         ]
 
+        reg = regularization if regularization is not None else 0.0
+
         result = minimize(
             self._neg_log_likelihood,
             initial_params,
-            args=(returns, dt),
+            args=(returns, dt, reg),
             bounds=bounds,
             method='L-BFGS-B',
             options={'maxiter': 500}
@@ -187,7 +164,7 @@ class MertonProcess(StochasticProcess):
         )
         return param_ses
 
-    def _neg_log_likelihood(self, params, returns, dt):
+    def _neg_log_likelihood(self, params, returns, dt, reg=0.0):
         """
         Negative log-likelihood for Merton model.
 
@@ -196,6 +173,8 @@ class MertonProcess(StochasticProcess):
 
         where mu_k = (mu - 0.5*sigma^2)*dt + k*jump_mu
               sigma_k^2 = sigma^2*dt + k*jump_sigma^2
+
+        When reg > 0, adds L2 penalty: reg * mu^2.
         """
         mu, sigma, lambda_, jump_mu, jump_sigma = params
 
@@ -230,7 +209,10 @@ class MertonProcess(StochasticProcess):
             else:
                 ll += np.log(density)
 
-        return -ll
+        nll = -ll
+        if reg > 0:
+            nll += reg * mu ** 2
+        return nll
 
     def _poisson_pmf(self, k: int, lam: float) -> float:
         """Poisson probability mass function."""
@@ -304,7 +286,7 @@ class MertonProcess(StochasticProcess):
 
         mu = self.mu_ if self.is_fitted else self.mu
         sigma = self.sigma_ if self.is_fitted else self.sigma
-        lambda_ = self.lambda__ if self.is_fitted else self.lambda_
+        lambda_ = self.lambda_ if self.is_fitted else self.lambda_
         jump_mu = self.jump_mu_ if self.is_fitted else self.jump_mu
         jump_sigma = self.jump_sigma_ if self.is_fitted else self.jump_sigma
 
@@ -350,7 +332,7 @@ class MertonProcess(StochasticProcess):
         """
         mu = self.mu_ if self.is_fitted else self.mu
         sigma = self.sigma_ if self.is_fitted else self.sigma
-        lambda_ = self.lambda__ if self.is_fitted else self.lambda_
+        lambda_ = self.lambda_ if self.is_fitted else self.lambda_
         jump_mu = self.jump_mu_ if self.is_fitted else self.jump_mu
 
         if any(p is None for p in [mu, sigma, lambda_, jump_mu]):
@@ -365,7 +347,7 @@ class MertonProcess(StochasticProcess):
         Var[r] = sigma^2 + lambda*(jump_mu^2 + jump_sigma^2)
         """
         sigma = self.sigma_ if self.is_fitted else self.sigma
-        lambda_ = self.lambda__ if self.is_fitted else self.lambda_
+        lambda_ = self.lambda_ if self.is_fitted else self.lambda_
         jump_mu = self.jump_mu_ if self.is_fitted else self.jump_mu
         jump_sigma = self.jump_sigma_ if self.is_fitted else self.jump_sigma
 

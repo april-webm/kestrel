@@ -1,8 +1,14 @@
 # kestrel/utils/kestrel_result.py
+"""Simulation result container with plotting and analysis methods."""
+
+from __future__ import annotations
+
+from typing import Any, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from typing import Optional
+
 
 class KestrelResult:
     """
@@ -11,7 +17,11 @@ class KestrelResult:
     This class holds simulation paths, typically a pandas DataFrame,
     and offers convenience methods for plotting and analysis.
     """
-    def __init__(self, paths: pd.DataFrame, initial_value: Optional[float] = None):
+
+    _paths: pd.DataFrame
+    _initial_value: Optional[float]
+
+    def __init__(self, paths: pd.DataFrame, initial_value: Optional[float] = None) -> None:
         if not isinstance(paths, pd.DataFrame):
             raise TypeError("`paths` must be a pandas DataFrame.")
         self._paths = paths
@@ -24,8 +34,14 @@ class KestrelResult:
         """
         return self._paths
 
-    def plot(self, title: str = "Simulation Paths", xlabel: str = "Time Step",
-             ylabel: str = "Value", figsize: tuple = (10, 6), **kwargs):
+    def plot(
+        self,
+        title: str = "Simulation Paths",
+        xlabel: str = "Time Step",
+        ylabel: str = "Value",
+        figsize: Tuple[int, int] = (10, 6),
+        **kwargs: Any,
+    ) -> None:
         """
         Plots the simulation paths.
 
@@ -48,7 +64,7 @@ class KestrelResult:
         """
         return self._paths.mean(axis=1)
 
-    def percentile_paths(self, percentiles: list = [25, 50, 75]) -> pd.DataFrame:
+    def percentile_paths(self, percentiles: Optional[List[float]] = None) -> pd.DataFrame:
         """
         Calculates percentile paths for the simulations.
 
@@ -58,6 +74,8 @@ class KestrelResult:
         Returns:
             pd.DataFrame: DataFrame with percentile paths.
         """
+        if percentiles is None:
+            percentiles = [25, 50, 75]
         return self._paths.quantile(np.array(percentiles) / 100, axis=1).T
 
     def __repr__(self) -> str:

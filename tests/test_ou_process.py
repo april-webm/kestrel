@@ -218,9 +218,9 @@ def test_ou_process_fit_single_data_point():
     data = pd.Series([10.0])
     # For AR(1) and MLE, need at least 2 points for diff() or regression.
     # We expect an error or a fallback behavior.
-    with pytest.raises(ValueError, match="estimation requires at least 2 data points."):
+    with pytest.raises(ValueError, match="[Ee]stimation requires at least 2 data points."):
         ou.fit(data, dt=1.0, method='mle')
-    with pytest.raises(ValueError, match="regression requires at least 2 data points."):
+    with pytest.raises(ValueError, match="[Ee]stimation requires at least 2 data points."):
         ou.fit(data, dt=1.0, method='ar1')
 
 def test_ou_process_fit_two_data_points():

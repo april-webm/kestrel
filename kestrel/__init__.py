@@ -16,6 +16,12 @@ from kestrel.diffusion import (
 )
 from kestrel.jump_diffusion import MertonProcess
 from kestrel.utils import KestrelResult
+from kestrel.utils.warnings import (
+    BiasWarning,
+    ConvergenceWarning,
+    FellerConditionWarning,
+    KestrelWarning,
+)
 
 __all__ = [
     # Base
@@ -29,4 +35,9 @@ __all__ = [
     "MertonProcess",
     # Utilities
     "KestrelResult",
+    # Warnings
+    "KestrelWarning",
+    "ConvergenceWarning",
+    "FellerConditionWarning",
+    "BiasWarning",
 ]

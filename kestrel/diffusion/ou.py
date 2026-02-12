@@ -1,9 +1,19 @@
 # kestrel/diffusion/ou.py
+"""Ornstein-Uhlenbeck process implementation."""
+
+from __future__ import annotations
+
+import warnings
+from typing import Dict, Optional
+
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
+
 from kestrel.base import StochasticProcess
+from kestrel.utils.fisher_information import ou_fisher_information
 from kestrel.utils.kestrel_result import KestrelResult
+from kestrel.utils.warnings import BiasWarning, ConvergenceWarning
+
 
 class OUProcess(StochasticProcess):
     """
@@ -17,25 +27,49 @@ class OUProcess(StochasticProcess):
         mu (float, optional): Long-term mean.
         sigma (float, optional): Volatility.
     """
-    def __init__(self, theta: float = None, mu: float = None, sigma: float = None):
+
+    theta: Optional[float]
+    mu: Optional[float]
+    sigma: Optional[float]
+
+    def __init__(self, theta: Optional[float] = None, mu: Optional[float] = None, sigma: Optional[float] = None) -> None:
         super().__init__()
         self.theta = theta
         self.mu = mu
         self.sigma = sigma
 
-    def fit(self, data: pd.Series, dt: float = None, method: str = 'mle', freq: str = None):
+    def fit(
+        self,
+        data: pd.Series,
+        dt: Optional[float] = None,
+        method: str = 'mle',
+        freq: Optional[str] = None,
+        bias_correction: bool = True,
+        regularization: Optional[float] = None,
+    ) -> None:
         """
         Estimates (theta, mu, sigma) parameters from time-series data.
+
+        The analytic MLE for the OU process is equivalent to OLS on the AR(1)
+        representation. Both 'mle' and 'ar1' methods use this closed-form solution.
 
         Args:
             data (pd.Series): Time-series data for fitting.
             dt (float, optional): Time step between observations.
                                    If None, inferred from data; else defaults to 1.0.
-            method (str): Estimation method: 'mle' (Exact Maximum Likelihood) or
-                          'ar1' (AR(1) regression).
+            method (str): Estimation method: 'mle' or 'ar1' (both use analytic MLE).
             freq (str, optional): Data frequency if `data` has `DatetimeIndex`.
                                   e.g., 'B' (business day), 'D' (calendar day).
                                   Converts `dt` to annual basis. Inferred if None.
+            bias_correction (bool): If True (default), applies delete-1 jackknife
+                                     bias correction to the mean-reversion speed estimate.
+                                     Corrects the Hurwicz bias that causes systematic
+                                     overestimation of theta in finite samples.
+                                     Skipped when regularization is active.
+            regularization (float, optional): L2 penalty strength on theta and mu.
+                                              When set, uses penalised MLE via scipy
+                                              instead of analytic solution. Bias correction
+                                              is skipped when regularization is active.
         Raises:
             ValueError: Input data not pandas Series or unknown estimation method.
         """
@@ -43,274 +77,309 @@ class OUProcess(StochasticProcess):
             raise ValueError("Input data must be a pandas Series.")
 
         if dt is None:
-            if isinstance(data.index, pd.DatetimeIndex):
-                # Need at least two points for time difference from index
-                if len(data.index) < 2: 
-                    dt = 1.0
-                    print("dt not provided, DatetimeIndex has less than 2 points. Defaulting to 1.0.")
-                else:
-                    inferred_timedelta = data.index[1] - data.index[0]
-                    # Determine frequency to convert timedelta to annual dt
-                    current_freq = freq # Use provided freq
-                    if current_freq is None:
-                        if data.index.freq:
-                            current_freq = data.index.freq
-                            print(f"Using frequency from DatetimeIndex.freq: {current_freq}")
-                        else:
-                            inferred_freq = pd.infer_freq(data.index)
-                            if inferred_freq:
-                                current_freq = inferred_freq
-                                print(f"Inferred frequency from DatetimeIndex: {current_freq}")
-                            else:
-                                print("Could not infer frequency from DatetimeIndex. Defaulting to business day ('B') for dt conversion.")
-                                current_freq = 'B' # Default if inference fails
+            dt = self._infer_dt(data)
 
-                    # Convert timedelta to numerical dt based on current_freq
-                    if current_freq in ['B', 'C', 'D']: # Business day, Custom Business Day, Calendar Day
-                        dt = inferred_timedelta / pd.Timedelta(days=252.0)
-                    elif current_freq in ['W', 'W-SUN', 'W-MON', 'W-TUE', 'W-WED', 'W-THU', 'W-FRI', 'W-SAT']: # Weekly
-                        dt = inferred_timedelta / pd.Timedelta(weeks=52)
-                    elif current_freq in ['M', 'MS', 'BM', 'BMS']: # Monthly
-                        dt = inferred_timedelta / pd.Timedelta(days=365/12)
-                    elif current_freq in ['Q', 'QS', 'BQ', 'BQS']: # Quarterly
-                        dt = inferred_timedelta / pd.Timedelta(days=365/4)
-                    elif current_freq in ['A', 'AS', 'BA', 'BAS', 'Y', 'YS', 'BY', 'BYS']: # Annual
-                        dt = inferred_timedelta / pd.Timedelta(days=365)
-                    else: # Fallback for other frequencies, or if conversion ambiguous
-                        dt = inferred_timedelta.total_seconds() / (365 * 24 * 3600)
-                        print(f"Using total seconds for dt conversion for frequency '{current_freq}'. Consider explicit dt.")
+        self.dt_ = dt
 
-                    if dt == 0: # Handle zero time_diffs
-                        dt = 1.0
-                    print(f"Inferred dt from DatetimeIndex: {dt} (annualized based on '{current_freq}' frequency)")
-            else: # Not DatetimeIndex
-                dt = 1.0
-                print("dt not provided; cannot infer from index. Defaulting to 1.0.")
-        
-        self.dt_ = dt # Store dt used for fitting
-
-        if method == 'mle':
-            self._fit_mle(data, dt, freq)
-        elif method == 'ar1':
-            self._fit_ar1(data, dt, freq)
+        if regularization is not None and regularization > 0:
+            self._fit_penalized_mle(data, dt, freq, regularization)
+        elif method in ('mle', 'ar1'):
+            self._fit_analytic(data, dt, freq, bias_correction=bias_correction)
         else:
             raise ValueError(f"Unknown estimation method: {method}. Choose 'mle' or 'ar1'.")
 
-
-    def _fit_mle(self, data: pd.Series, dt: float, freq: str = None):
+    def _fit_analytic(self, data: pd.Series, dt: float, freq: Optional[str] = None, bias_correction: bool = True) -> None:
         """
-        Estimates OU parameters using Exact Maximum Likelihood Estimation.
-        Method based on transition density.
-        """
-        if len(data) < 2:
-            raise ValueError("MLE estimation requires at least 2 data points.")
-        x = data.values
-        n = len(x)
-        
-        # Initial parameter guess
-        # Based on approximate moment matching / AR(1) regression for start values
-        dx = np.diff(x)
+        Estimates OU parameters using the analytic MLE (equivalent to AR(1) regression).
 
-        # Approximate AR(1) parameters for initial guess
-        # Regression: dx = a + b*x + epsilon
-        X_reg = np.vstack([np.ones(n - 1), x[:-1]]).T
-        beta_hat = np.linalg.lstsq(X_reg, dx, rcond=None)[0]
-        a, b = beta_hat[0], beta_hat[1]
+        The OU transition density is Gaussian:
+            X_{t+dt} | X_t ~ N(X_t * exp(-theta*dt) + mu*(1-exp(-theta*dt)),
+                              sigma^2*(1-exp(-2*theta*dt))/(2*theta))
 
-        # Map AR(1) to OU for initial guess
-        theta_0 = -b / dt
-        mu_0 = -a / b if b != 0 else np.mean(x) # Fallback if b near zero
-        
-        # Estimate sigma from residuals
-        residuals = dx - (a + b * x[:-1])
-        sigma_sq_0 = np.var(residuals) / dt # Rough initial sigma^2
-        sigma_0 = np.sqrt(sigma_sq_0) if sigma_sq_0 > 0 else 0.1
-
-        # Ensure theta_0 positive
-        theta_0 = max(0.01, theta_0)
-
-        initial_params = [theta_0, mu_0, sigma_0]
-
-        # Bounds for parameters: theta > 0, sigma > 0
-        bounds = [(1e-6, None), (None, None), (1e-6, None)]
-
-        # Use L-BFGS-B method as it supports bounds and can return approximation of inverse Hessian
-        result = minimize(self._log_likelihood_ou, initial_params, args=(x, dt), bounds=bounds, method='L-BFGS-B')
-
-        if result.success:
-            self.theta, self.mu, self.sigma = result.x
-            
-            param_ses = {}
-            # Calculate standard errors from the inverse Hessian (covariance matrix approximation)
-            # The inverse Hessian is returned as result.hess_inv for 'L-BFGS-B'
-            if hasattr(result, 'hess_inv') and result.hess_inv is not None:
-                # Convert hess_inv (LinearOperator) to a dense matrix if it's not already
-                # hess_inv can be either a dense array or a LinearOperator
-                if callable(getattr(result.hess_inv, 'todense', None)):
-                    cov_matrix = result.hess_inv.todense()
-                else: # Assume it's already a dense matrix or array
-                    cov_matrix = result.hess_inv
-                
-                # Check if cov_matrix is a square matrix of expected size
-                if cov_matrix.shape == (len(initial_params), len(initial_params)):
-                    param_ses = {
-                        'theta': np.sqrt(cov_matrix[0, 0]),
-                        'mu': np.sqrt(cov_matrix[1, 1]),
-                        'sigma': np.sqrt(cov_matrix[2, 2]),
-                    }
-                else:
-                    print("Warning: Hessian inverse shape mismatch, cannot calculate standard errors.")
-            else:
-                print("Warning: Could not retrieve Hessian inverse for standard error calculation.")
-        else:
-            raise RuntimeError(f"MLE optimization failed: {result.message}")
-        
-        # Store parameters and standard errors
-        self._set_params(last_data_point=data.iloc[-1], theta=self.theta, mu=self.mu, sigma=self.sigma, 
-                         dt=self.dt_, freq=freq, param_ses=param_ses)
-
-    def _log_likelihood_ou(self, params, x, dt):
-        """
-        Negative log-likelihood function for OU process (Exact MLE).
-        """
-        theta, mu, sigma = params
-        n = len(x)
-
-        if theta <= 0 or sigma <= 0:
-            return np.inf # Penalise invalid parameters
-
-        # Pre-calculate terms
-        exp_theta_dt = np.exp(-theta * dt)
-        one_minus_exp_theta_dt = 1 - exp_theta_dt
-        
-        # Variance of conditional distribution X_t | X_{t-1}
-        variance_conditional = sigma**2 * (1 - exp_theta_dt**2) / (2 * theta)
-
-        # Numerical stability check for variance_conditional
-        if variance_conditional <= 1e-12: # Small positive threshold
-            return np.inf
-
-        log_variance_conditional = np.log(variance_conditional)
-        log_2pi = np.log(2 * np.pi)
-
-        ll = 0.0
-        for i in range(1, n):
-            mean_conditional = x[i-1] * exp_theta_dt + mu * one_minus_exp_theta_dt
-            
-            # Normal PDF log-likelihood part
-            ll += -0.5 * (log_variance_conditional + log_2pi)
-            ll += -0.5 * ((x[i] - mean_conditional)**2 / variance_conditional)
-        
-        return -ll # Minimise negative log-likelihood
-
-    def _fit_ar1(self, data: pd.Series, dt: float, freq: str = None):
-        """
-        Estimates OU parameters using AR(1) regression.
-        Maps coefficients back to continuous-time parameters.
+        This is equivalent to AR(1): X_{t+1} = c + phi*X_t + epsilon
+        where phi = exp(-theta*dt), c = mu*(1-phi).
+        OLS gives the exact MLE.
         """
         if len(data) < 2:
-            raise ValueError("AR(1) regression requires at least 2 data points.")
+            raise ValueError("Estimation requires at least 2 data points.")
+
         x_t = data.iloc[:-1].values
         x_t_plus_dt = data.iloc[1:].values
         n = len(x_t)
 
-        # Linear regression: x_{t+dt} = c + phi * x_t + epsilon
+        # OLS regression: x_{t+dt} = c + phi * x_t + epsilon
         X_reg = np.vstack([np.ones(n), x_t]).T
-        
-        # Robust LSQ
         beta_hat, ss_residuals, rank, s = np.linalg.lstsq(X_reg, x_t_plus_dt, rcond=None)
-        
         c, phi = beta_hat[0], beta_hat[1]
 
-        # Calculate standard errors for c and phi
-        # Residual variance: sigma_epsilon_sq
-        sigma_epsilon_sq = ss_residuals[0] / (n - rank) if (n - rank) > 0 else np.var(x_t_plus_dt)
-        
-        # Covariance matrix for beta_hat (c, phi)
-        # (X_reg^T X_reg)^-1 * sigma_epsilon_sq
+        # Compute regression standard errors
+        epsilon_t = x_t_plus_dt - (c + phi * x_t)
+        sigma_epsilon_sq = float(np.var(epsilon_t))
+        if len(ss_residuals) > 0 and (n - rank) > 0:
+            sigma_epsilon_sq_ols = float(ss_residuals[0] / (n - rank))
+        else:
+            sigma_epsilon_sq_ols = sigma_epsilon_sq
+
         try:
-            cov_beta = np.linalg.inv(X_reg.T @ X_reg) * sigma_epsilon_sq
-            se_c = np.sqrt(cov_beta[0, 0])
-            se_phi = np.sqrt(cov_beta[1, 1])
-            cov_c_phi = cov_beta[0, 1]
+            cov_beta = np.linalg.inv(X_reg.T @ X_reg) * sigma_epsilon_sq_ols
+            se_c = float(np.sqrt(cov_beta[0, 0]))
+            se_phi = float(np.sqrt(cov_beta[1, 1]))
+            cov_c_phi = float(cov_beta[0, 1])
         except np.linalg.LinAlgError:
-            print("Warning: Could not invert (X_reg.T @ X_reg) for AR(1) standard errors.")
+            warnings.warn(
+                "Could not invert (X_reg.T @ X_reg) for standard errors.",
+                ConvergenceWarning,
+                stacklevel=2,
+            )
             se_c, se_phi, cov_c_phi = np.nan, np.nan, np.nan
 
-        param_ses = {}
+        param_ses: Dict[str, float] = {}
+
+        # Compute data-derived fallback sigma
+        dx = np.diff(data.values)
+        fallback_sigma = float(np.sqrt(np.var(dx, ddof=1) / dt)) if len(dx) > 1 else 0.1
 
         # Map AR(1) coefficients to OU parameters
-        if phi >= 1.0 - 1e-6: # Check for stationarity / near-unit root
-            print("Warning: AR(1) coefficient phi >= 1.0. OU process may not be stationary / mean-reverting. Setting theta small positive.")
-            self.theta = 1e-6 # Set small positive theta
-            self.mu = np.mean(data) # Long-term mean is data mean
-            self.sigma = 0.1 # Default sigma
-            # Assign NaNs for SE as parameters are defaulted
-            param_ses['theta'] = np.nan
-            param_ses['mu'] = np.nan
-            param_ses['sigma'] = np.nan
+        if phi >= 1.0 - 1e-6:
+            warnings.warn(
+                f"AR(1) coefficient phi={phi:.6f} >= 1. The data appears "
+                f"non-stationary; the OU mean-reversion model is not appropriate. "
+                f"Parameters are set to fallback values; standard errors are unavailable.",
+                ConvergenceWarning,
+                stacklevel=2,
+            )
+            self.theta = 1e-6
+            self.mu = float(np.mean(data))
+            self.sigma = fallback_sigma
+            self._non_stationary_ = True
+            param_ses = {'theta': np.nan, 'mu': np.nan, 'sigma': np.nan}
+        elif phi <= 0:
+            warnings.warn(
+                f"AR(1) coefficient phi={phi:.6f} <= 0. This implies negative "
+                f"autocorrelation inconsistent with a standard OU process. "
+                f"Parameters are set to fallback values; standard errors are unavailable.",
+                ConvergenceWarning,
+                stacklevel=2,
+            )
+            self.theta = 1e-6
+            self.mu = float(np.mean(data))
+            self.sigma = fallback_sigma
+            self._non_stationary_ = True
+            param_ses = {'theta': np.nan, 'mu': np.nan, 'sigma': np.nan}
         else:
-            # Ensure theta positive. If phi > 1, log(phi) > 0, theta negative.
-            # If phi negative, log(phi) complex. Assume phi between 0 and 1 for stationary OU.
-            if phi <= 0:
-                print("Warning: Inferred AR(1) coefficient phi non-positive. Setting theta small positive, mu to data mean.")
-                self.theta = 1e-6
-                self.mu = np.mean(data)
-                self.sigma = 0.1 # Default sigma
-                param_ses['theta'] = np.nan
-                param_ses['mu'] = np.nan
-                param_ses['sigma'] = np.nan
+            self._non_stationary_ = False
+            self.theta = float(-np.log(phi) / dt)
+            self.mu = float(c / (1 - phi))
+
+            # Sigma from residual variance
+            if self.theta > 0 and (1 - np.exp(-2 * self.theta * dt)) > 0:
+                sigma_sq_ou = (sigma_epsilon_sq * 2 * self.theta) / (1 - np.exp(-2 * self.theta * dt))
+                self.sigma = float(np.sqrt(sigma_sq_ou))
             else:
-                self.theta = -np.log(phi) / dt
-                self.mu = c / (1 - phi)
-                
-                # Estimate sigma from residuals (same as before)
-                epsilon_t = x_t_plus_dt - (c + phi * x_t)
-                sigma_epsilon_sq = np.var(epsilon_t)
-                
-                if self.theta > 0 and (1 - np.exp(-2 * self.theta * dt)) > 0:
-                    sigma_sq_ou = (sigma_epsilon_sq * 2 * self.theta) / (1 - np.exp(-2 * self.theta * dt))
-                    self.sigma = np.sqrt(sigma_sq_ou)
-                else:
-                    self.sigma = np.sqrt(sigma_epsilon_sq / dt) # Fallback if theta near zero
-                
-                if self.sigma <= 0:
-                    self.sigma = 0.1 # Ensure sigma positive
+                self.sigma = float(np.sqrt(sigma_epsilon_sq / dt))
 
-                # Calculate standard errors for OU parameters using Delta Method approximations
-                # d(theta)/d(phi) = -1 / (phi * dt)
-                # d(mu)/d(c) = 1 / (1 - phi)
-                # d(mu)/d(phi) = c / (1 - phi)^2
+            if self.sigma <= 0:
+                self.sigma = 0.1
 
-                d_theta_d_phi = -1 / (phi * dt)
-                se_theta = np.abs(d_theta_d_phi) * se_phi if not np.isnan(se_phi) else np.nan
-                
-                d_mu_d_c = 1 / (1 - phi)
-                d_mu_d_phi = c / ((1 - phi)**2)
-                
-                # Variance of mu: Var(mu) = (d(mu)/dc)^2 Var(c) + (d(mu)/dphi)^2 Var(phi) + 2 (d(mu)/dc)(d(mu)/dphi)Cov(c,phi)
-                # Assuming Var(c) = se_c^2, Var(phi) = se_phi^2
-                if not np.isnan(se_c) and not np.isnan(se_phi) and not np.isnan(cov_c_phi):
-                    se_mu_sq = (d_mu_d_c**2 * se_c**2) + (d_mu_d_phi**2 * se_phi**2) + (2 * d_mu_d_c * d_mu_d_phi * cov_c_phi)
-                    se_mu = np.sqrt(se_mu_sq) if se_mu_sq >= 0 else np.nan
-                else:
-                    se_mu = np.nan
+            # Apply jackknife bias correction if requested
+            if bias_correction:
+                self.theta, self.mu, self.sigma = self._jackknife_bias_correction(
+                    x_t, x_t_plus_dt, dt, self.theta, self.mu, self.sigma
+                )
+                self._bias_corrected_ = True
+            else:
+                self._bias_corrected_ = False
 
-                # A simple approximation for sigma SE (might need more rigorous derivation)
-                se_sigma = self.sigma * np.sqrt(sigma_epsilon_sq / (2 * n * dt * self.theta)) if self.theta > 0 else np.nan
+            # Standard errors from analytical Fisher Information (at final parameter values)
+            self._fisher_information_, param_ses = ou_fisher_information(
+                self.theta, self.mu, self.sigma, dt, n, x_t
+            )
 
+        self._set_params(
+            last_data_point=data.iloc[-1],
+            theta=self.theta,
+            mu=self.mu,
+            sigma=self.sigma,
+            dt=self.dt_,
+            freq=freq,
+            param_ses=param_ses
+        )
 
+    def _fit_penalized_mle(
+        self, data: pd.Series, dt: float, freq: Optional[str], regularization: float
+    ) -> None:
+        """
+        Penalised MLE for OU process via L-BFGS-B.
+
+        Objective: NLL + lambda * (theta^2 + mu^2)
+
+        Uses the analytic solution as initial values. Standard errors are
+        computed from the numerical inverse Hessian (these are penalised/posterior
+        SEs, not frequentist SEs).
+        """
+        from scipy.optimize import minimize as sp_minimize
+
+        if len(data) < 2:
+            raise ValueError("Estimation requires at least 2 data points.")
+
+        x_t = data.iloc[:-1].values
+        x_tp = data.iloc[1:].values
+        n = len(x_t)
+
+        # Get analytic solution for initial values
+        X_reg = np.vstack([np.ones(n), x_t]).T
+        beta_hat, _, _, _ = np.linalg.lstsq(X_reg, x_tp, rcond=None)
+        c0, phi0 = beta_hat[0], beta_hat[1]
+
+        if 0 < phi0 < 1.0 - 1e-6:
+            theta0 = -np.log(phi0) / dt
+            mu0 = c0 / (1 - phi0)
+            eps0 = x_tp - (c0 + phi0 * x_t)
+            sig_eps_sq0 = float(np.var(eps0))
+            if theta0 > 0 and (1 - np.exp(-2 * theta0 * dt)) > 0:
+                sigma0 = np.sqrt(sig_eps_sq0 * 2 * theta0 / (1 - np.exp(-2 * theta0 * dt)))
+            else:
+                sigma0 = np.sqrt(sig_eps_sq0 / dt)
+        else:
+            theta0, mu0, sigma0 = 1.0, float(np.mean(data)), float(np.std(np.diff(data.values)) / np.sqrt(dt))
+
+        def penalized_nll(params: np.ndarray) -> float:
+            theta, mu, sigma = params
+            if theta <= 0 or sigma <= 0:
+                return np.inf
+            phi = np.exp(-theta * dt)
+            c = mu * (1 - phi)
+            sigma_eps_sq = sigma ** 2 * (1 - phi ** 2) / (2 * theta)
+            if sigma_eps_sq <= 0:
+                return np.inf
+            residuals = x_tp - (c + phi * x_t)
+            nll = 0.5 * n * np.log(2 * np.pi * sigma_eps_sq) + np.sum(residuals ** 2) / (2 * sigma_eps_sq)
+            penalty = regularization * (theta ** 2 + mu ** 2)
+            return nll + penalty
+
+        result = sp_minimize(
+            penalized_nll,
+            [theta0, mu0, sigma0],
+            bounds=[(1e-6, None), (None, None), (1e-6, None)],
+            method='L-BFGS-B',
+        )
+
+        if result.success:
+            self.theta, self.mu, self.sigma = float(result.x[0]), float(result.x[1]), float(result.x[2])
+        else:
+            self.theta, self.mu, self.sigma = float(theta0), float(mu0), float(sigma0)
+
+        self._bias_corrected_ = False
+        self._non_stationary_ = False
+
+        # SEs from numerical inverse Hessian
+        param_ses: Dict[str, float] = {}
+        if hasattr(result, 'hess_inv') and result.hess_inv is not None:
+            if callable(getattr(result.hess_inv, 'todense', None)):
+                cov_matrix = np.asarray(result.hess_inv.todense())
+            else:
+                cov_matrix = np.asarray(result.hess_inv)
+            if cov_matrix.shape == (3, 3):
                 param_ses = {
-                    'theta': se_theta,
-                    'mu': se_mu,
-                    'sigma': se_sigma
+                    'theta': float(np.sqrt(max(0, cov_matrix[0, 0]))),
+                    'mu': float(np.sqrt(max(0, cov_matrix[1, 1]))),
+                    'sigma': float(np.sqrt(max(0, cov_matrix[2, 2]))),
                 }
+            else:
+                param_ses = {'theta': np.nan, 'mu': np.nan, 'sigma': np.nan}
+        else:
+            param_ses = {'theta': np.nan, 'mu': np.nan, 'sigma': np.nan}
 
-        # Store parameters and standard errors
-        self._set_params(last_data_point=data.iloc[-1], theta=self.theta, mu=self.mu, sigma=self.sigma,
-                         dt=self.dt_, freq=freq, param_ses=param_ses)
+        self._set_params(
+            last_data_point=data.iloc[-1],
+            theta=self.theta,
+            mu=self.mu,
+            sigma=self.sigma,
+            dt=self.dt_,
+            freq=freq,
+            param_ses=param_ses,
+        )
 
-    def sample(self, n_paths: int = 1, horizon: int = 1, dt: float = None) -> KestrelResult:
+    def _jackknife_bias_correction(
+        self,
+        x_t: np.ndarray,
+        x_tp: np.ndarray,
+        dt: float,
+        theta_full: float,
+        mu_full: float,
+        sigma_full: float,
+    ) -> tuple:
+        """
+        Delete-1 jackknife bias correction for OU parameters.
+
+        Corrects the Hurwicz bias that causes systematic overestimation of
+        theta (mean-reversion speed) in finite samples. The jackknife estimate is:
+            theta_jk = n * theta_full - (n-1) * mean(theta_loo)
+
+        For time series, removes each consecutive transition (x_t, x_{t+dt})
+        to maintain the Markov structure.
+
+        Complexity: O(n^2) — each of n leave-one-out samples requires a 2x2 OLS
+        solve. Fast enough for n < 50,000.
+
+        Returns:
+            (theta_corrected, mu_corrected, sigma_corrected)
+        """
+        n = len(x_t)
+
+        theta_loo = np.empty(n)
+        mu_loo = np.empty(n)
+        sigma_loo = np.empty(n)
+        valid = np.ones(n, dtype=bool)
+
+        for i in range(n):
+            mask = np.ones(n, dtype=bool)
+            mask[i] = False
+
+            x_t_i = x_t[mask]
+            x_tp_i = x_tp[mask]
+
+            X_reg_i = np.vstack([np.ones(n - 1), x_t_i]).T
+            beta_hat_i, _, _, _ = np.linalg.lstsq(X_reg_i, x_tp_i, rcond=None)
+            c_i, phi_i = beta_hat_i[0], beta_hat_i[1]
+
+            if 0 < phi_i < 1.0 - 1e-6:
+                theta_i = -np.log(phi_i) / dt
+                mu_i = c_i / (1 - phi_i)
+                eps_i = x_tp_i - (c_i + phi_i * x_t_i)
+                sigma_eps_sq_i = float(np.var(eps_i))
+                if theta_i > 0 and (1 - np.exp(-2 * theta_i * dt)) > 0:
+                    sigma_sq_i = sigma_eps_sq_i * 2 * theta_i / (1 - np.exp(-2 * theta_i * dt))
+                    sigma_i = np.sqrt(sigma_sq_i)
+                else:
+                    sigma_i = np.sqrt(sigma_eps_sq_i / dt)
+                theta_loo[i] = theta_i
+                mu_loo[i] = mu_i
+                sigma_loo[i] = sigma_i
+            else:
+                valid[i] = False
+
+        n_valid = valid.sum()
+        if n_valid < n * 0.5:
+            warnings.warn(
+                "Jackknife bias correction failed: too many leave-one-out samples "
+                "were non-stationary. Returning uncorrected estimates.",
+                BiasWarning,
+                stacklevel=3,
+            )
+            return theta_full, mu_full, sigma_full
+
+        theta_jk = float(n * theta_full - (n - 1) * np.mean(theta_loo[valid]))
+        mu_jk = float(n * mu_full - (n - 1) * np.mean(mu_loo[valid]))
+        sigma_jk = float(n * sigma_full - (n - 1) * np.mean(sigma_loo[valid]))
+
+        # Ensure physical constraints
+        theta_jk = max(1e-8, theta_jk)
+        sigma_jk = max(1e-8, sigma_jk)
+
+        return theta_jk, mu_jk, sigma_jk
+
+    def sample(self, n_paths: int = 1, horizon: int = 1, dt: Optional[float] = None) -> KestrelResult:
         """
         Simulates future paths using Euler-Maruyama method.
 
@@ -351,7 +420,7 @@ class OUProcess(StochasticProcess):
             initial_val = self._last_data_point
             paths[0, :] = initial_val
         else:
-            initial_val = mu  # Start at long-term mean if not fitted
+            initial_val = mu
             paths[0, :] = initial_val
 
         # Euler-Maruyama simulation

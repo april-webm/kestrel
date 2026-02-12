@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import warnings
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy import stats
+from scipy.optimize import minimize as sp_minimize
 
 from kestrel.base import StochasticProcess
 from kestrel.utils.fisher_information import ou_fisher_information
@@ -46,7 +48,7 @@ class OUProcess(StochasticProcess):
         freq: Optional[str] = None,
         bias_correction: bool = True,
         regularization: Optional[float] = None,
-    ) -> None:
+    ) -> KestrelResult:
         """
         Estimates (theta, mu, sigma) parameters from time-series data.
 
@@ -57,7 +59,7 @@ class OUProcess(StochasticProcess):
             data (pd.Series): Time-series data for fitting.
             dt (float, optional): Time step between observations.
                                    If None, inferred from data; else defaults to 1.0.
-            method (str): Estimation method: 'mle' or 'ar1' (both use analytic MLE).
+            method (str): Estimation method: 'mle', 'ar1', or 'kalman'.
             freq (str, optional): Data frequency if `data` has `DatetimeIndex`.
                                   e.g., 'B' (business day), 'D' (calendar day).
                                   Converts `dt` to annual basis. Inferred if None.
@@ -72,6 +74,9 @@ class OUProcess(StochasticProcess):
                                               is skipped when regularization is active.
         Raises:
             ValueError: Input data not pandas Series or unknown estimation method.
+
+        Returns:
+            KestrelResult: An object containing estimation results, diagnostics, and potentially simulated paths.
         """
         if not isinstance(data, pd.Series):
             raise ValueError("Input data must be a pandas Series.")
@@ -79,16 +84,38 @@ class OUProcess(StochasticProcess):
         if dt is None:
             dt = self._infer_dt(data)
 
-        self.dt_ = dt
+        self.dt_ = dt # Store dt on self for sample method if not passed explicitly
+        n_obs = len(data) - 1
 
         if regularization is not None and regularization > 0:
-            self._fit_penalized_mle(data, dt, freq, regularization)
+            theta, mu, sigma, param_ses, log_likelihood, residuals = self._fit_penalized_mle(data, dt, regularization)
         elif method in ('mle', 'ar1'):
-            self._fit_analytic(data, dt, freq, bias_correction=bias_correction)
+            theta, mu, sigma, param_ses, log_likelihood, residuals = self._fit_analytic(data, dt, bias_correction=bias_correction)
+        elif method == 'kalman':
+            theta, mu, sigma, param_ses, log_likelihood, residuals = self._fit_kalman(data, dt)
         else:
-            raise ValueError(f"Unknown estimation method: {method}. Choose 'mle' or 'ar1'.")
+            raise ValueError(f"Unknown estimation method: {method}. Choose 'mle', 'ar1', or 'kalman'.")
 
-    def _fit_analytic(self, data: pd.Series, dt: float, freq: Optional[str] = None, bias_correction: bool = True) -> None:
+        self.theta = theta # Store on self for sample method if not passed explicitly
+        self.mu = mu
+        self.sigma = sigma
+
+        self._post_fit_setup(
+            last_data_point=data.iloc[-1],
+            dt=self.dt_,
+            freq=freq
+        )
+
+        return KestrelResult(
+            process_name="OUProcess",
+            params={'theta': theta, 'mu': mu, 'sigma': sigma},
+            param_ses=param_ses,
+            log_likelihood=log_likelihood,
+            residuals=residuals,
+            n_obs=n_obs,
+        )
+
+    def _fit_analytic(self, data: pd.Series, dt: float, bias_correction: bool = True) -> Tuple[float, float, float, Dict[str, float], float, np.ndarray]:
         """
         Estimates OU parameters using the analytic MLE (equivalent to AR(1) regression).
 
@@ -120,20 +147,8 @@ class OUProcess(StochasticProcess):
         else:
             sigma_epsilon_sq_ols = sigma_epsilon_sq
 
-        try:
-            cov_beta = np.linalg.inv(X_reg.T @ X_reg) * sigma_epsilon_sq_ols
-            se_c = float(np.sqrt(cov_beta[0, 0]))
-            se_phi = float(np.sqrt(cov_beta[1, 1]))
-            cov_c_phi = float(cov_beta[0, 1])
-        except np.linalg.LinAlgError:
-            warnings.warn(
-                "Could not invert (X_reg.T @ X_reg) for standard errors.",
-                ConvergenceWarning,
-                stacklevel=2,
-            )
-            se_c, se_phi, cov_c_phi = np.nan, np.nan, np.nan
-
         param_ses: Dict[str, float] = {}
+        theta, mu, sigma = np.nan, np.nan, np.nan # Initialize
 
         # Compute data-derived fallback sigma
         dx = np.diff(data.values)
@@ -148,10 +163,10 @@ class OUProcess(StochasticProcess):
                 ConvergenceWarning,
                 stacklevel=2,
             )
-            self.theta = 1e-6
-            self.mu = float(np.mean(data))
-            self.sigma = fallback_sigma
-            self._non_stationary_ = True
+            theta = 1e-6
+            mu = float(np.mean(data))
+            sigma = fallback_sigma
+            # self._non_stationary_ = True # No longer set on self
             param_ses = {'theta': np.nan, 'mu': np.nan, 'sigma': np.nan}
         elif phi <= 0:
             warnings.warn(
@@ -161,53 +176,49 @@ class OUProcess(StochasticProcess):
                 ConvergenceWarning,
                 stacklevel=2,
             )
-            self.theta = 1e-6
-            self.mu = float(np.mean(data))
-            self.sigma = fallback_sigma
-            self._non_stationary_ = True
+            theta = 1e-6
+            mu = float(np.mean(data))
+            sigma = fallback_sigma
+            # self._non_stationary_ = True # No longer set on self
             param_ses = {'theta': np.nan, 'mu': np.nan, 'sigma': np.nan}
         else:
-            self._non_stationary_ = False
-            self.theta = float(-np.log(phi) / dt)
-            self.mu = float(c / (1 - phi))
+            # self._non_stationary_ = False # No longer set on self
+            theta = float(-np.log(phi) / dt)
+            mu = float(c / (1 - phi))
 
             # Sigma from residual variance
-            if self.theta > 0 and (1 - np.exp(-2 * self.theta * dt)) > 0:
-                sigma_sq_ou = (sigma_epsilon_sq * 2 * self.theta) / (1 - np.exp(-2 * self.theta * dt))
-                self.sigma = float(np.sqrt(sigma_sq_ou))
+            if theta > 0 and (1 - np.exp(-2 * theta * dt)) > 0:
+                sigma_sq_ou = (sigma_epsilon_sq * 2 * theta) / (1 - np.exp(-2 * theta * dt))
+                sigma = float(np.sqrt(sigma_sq_ou))
             else:
-                self.sigma = float(np.sqrt(sigma_epsilon_sq / dt))
+                sigma = float(np.sqrt(sigma_epsilon_sq / dt))
 
-            if self.sigma <= 0:
-                self.sigma = 0.1
+            if sigma <= 0:
+                sigma = 0.1
 
             # Apply jackknife bias correction if requested
             if bias_correction:
-                self.theta, self.mu, self.sigma = self._jackknife_bias_correction(
-                    x_t, x_t_plus_dt, dt, self.theta, self.mu, self.sigma
+                theta, mu, sigma = self._jackknife_bias_correction(
+                    x_t, x_t_plus_dt, dt, theta, mu, sigma
                 )
-                self._bias_corrected_ = True
+                # self._bias_corrected_ = True # No longer set on self
             else:
-                self._bias_corrected_ = False
+                pass
+                # self._bias_corrected_ = False # No longer set on self
 
             # Standard errors from analytical Fisher Information (at final parameter values)
-            self._fisher_information_, param_ses = ou_fisher_information(
-                self.theta, self.mu, self.sigma, dt, n, x_t
+            _, param_ses = ou_fisher_information(
+                theta, mu, sigma, dt, n, x_t
             )
+        
+        # Calculate log-likelihood and residuals based on final parameters
+        log_likelihood, residuals = self._calculate_ou_log_likelihood_and_residuals(data, dt, theta, mu, sigma)
 
-        self._set_params(
-            last_data_point=data.iloc[-1],
-            theta=self.theta,
-            mu=self.mu,
-            sigma=self.sigma,
-            dt=self.dt_,
-            freq=freq,
-            param_ses=param_ses
-        )
+        return theta, mu, sigma, param_ses, log_likelihood, residuals
 
     def _fit_penalized_mle(
-        self, data: pd.Series, dt: float, freq: Optional[str], regularization: float
-    ) -> None:
+        self, data: pd.Series, dt: float, regularization: float
+    ) -> Tuple[float, float, float, Dict[str, float], float, np.ndarray]:
         """
         Penalised MLE for OU process via L-BFGS-B.
 
@@ -217,8 +228,6 @@ class OUProcess(StochasticProcess):
         computed from the numerical inverse Hessian (these are penalised/posterior
         SEs, not frequentist SEs).
         """
-        from scipy.optimize import minimize as sp_minimize
-
         if len(data) < 2:
             raise ValueError("Estimation requires at least 2 data points.")
 
@@ -247,13 +256,13 @@ class OUProcess(StochasticProcess):
             theta, mu, sigma = params
             if theta <= 0 or sigma <= 0:
                 return np.inf
-            phi = np.exp(-theta * dt)
-            c = mu * (1 - phi)
-            sigma_eps_sq = sigma ** 2 * (1 - phi ** 2) / (2 * theta)
-            if sigma_eps_sq <= 0:
+            phi_val = np.exp(-theta * dt)
+            c_val = mu * (1 - phi_val)
+            sigma_eps_sq_val = sigma ** 2 * (1 - phi_val ** 2) / (2 * theta)
+            if sigma_eps_sq_val <= 0:
                 return np.inf
-            residuals = x_tp - (c + phi * x_t)
-            nll = 0.5 * n * np.log(2 * np.pi * sigma_eps_sq) + np.sum(residuals ** 2) / (2 * sigma_eps_sq)
+            residuals_val = x_tp - (c_val + phi_val * x_t)
+            nll = 0.5 * n * np.log(2 * np.pi * sigma_eps_sq_val) + np.sum(residuals_val ** 2) / (2 * sigma_eps_sq_val)
             penalty = regularization * (theta ** 2 + mu ** 2)
             return nll + penalty
 
@@ -264,13 +273,14 @@ class OUProcess(StochasticProcess):
             method='L-BFGS-B',
         )
 
+        theta, mu, sigma = np.nan, np.nan, np.nan # Initialize
         if result.success:
-            self.theta, self.mu, self.sigma = float(result.x[0]), float(result.x[1]), float(result.x[2])
+            theta, mu, sigma = float(result.x[0]), float(result.x[1]), float(result.x[2])
         else:
-            self.theta, self.mu, self.sigma = float(theta0), float(mu0), float(sigma0)
+            theta, mu, sigma = float(theta0), float(mu0), float(sigma0)
 
-        self._bias_corrected_ = False
-        self._non_stationary_ = False
+        # self._bias_corrected_ = False # No longer set on self
+        # self._non_stationary_ = False # No longer set on self
 
         # SEs from numerical inverse Hessian
         param_ses: Dict[str, float] = {}
@@ -290,15 +300,182 @@ class OUProcess(StochasticProcess):
         else:
             param_ses = {'theta': np.nan, 'mu': np.nan, 'sigma': np.nan}
 
-        self._set_params(
-            last_data_point=data.iloc[-1],
-            theta=self.theta,
-            mu=self.mu,
-            sigma=self.sigma,
-            dt=self.dt_,
-            freq=freq,
-            param_ses=param_ses,
+        log_likelihood, residuals = self._calculate_ou_log_likelihood_and_residuals(data, dt, theta, mu, sigma)
+
+        return theta, mu, sigma, param_ses, log_likelihood, residuals
+
+    def _fit_kalman(self, data: pd.Series, dt: float) -> Tuple[float, float, float, Dict[str, float], float, np.ndarray]:
+        """
+        Estimates OU parameters using Kalman Filter-based MLE.
+        The Kalman Filter is used to calculate the likelihood of the observations,
+        which is then maximized using scipy.optimize.minimize.
+        Assumes direct observation of the state.
+        """
+        if len(data) < 2:
+            raise ValueError("Kalman filter estimation requires at least 2 data points.")
+
+        x = data.values # Observations
+        n = len(x)
+
+        # Initial parameter estimates (e.g., from OLS/analytic MLE)
+        x_t = data.iloc[:-1].values
+        x_tp = data.iloc[1:].values
+        n_ols = len(x_t)
+        X_reg = np.vstack([np.ones(n_ols), x_t]).T
+        beta_hat, _, _, _ = np.linalg.lstsq(X_reg, x_tp, rcond=None)
+        c0, phi0 = beta_hat[0], beta_hat[1]
+        
+        theta0, mu0, sigma0 = 1.0, float(np.mean(data)), float(np.std(np.diff(data.values)) / np.sqrt(dt))
+
+        if 0 < phi0 < 1.0 - 1e-6:
+            theta0 = -np.log(phi0) / dt
+            mu0 = c0 / (1 - phi0)
+            eps0 = x_tp - (c0 + phi0 * x_t)
+            sig_eps_sq0 = float(np.var(eps0))
+            if theta0 > 0 and (1 - np.exp(-2 * theta0 * dt)) > 0:
+                sigma0 = np.sqrt(sig_eps_sq0 * 2 * theta0 / (1 - np.exp(-2 * theta0 * dt)))
+            else:
+                sigma0 = np.sqrt(sig_eps_sq0 / dt)
+        
+        initial_params = [theta0, mu0, sigma0]
+        bounds = [(1e-6, None), (None, None), (1e-6, None)] # theta, sigma > 0
+
+        # Minimize negative log-likelihood from Kalman Filter
+        result = sp_minimize(
+            self._kalman_filter_log_likelihood,
+            initial_params,
+            args=(x, dt),
+            bounds=bounds,
+            method='L-BFGS-B',
+            options={'maxiter': 1000}
         )
+        
+        theta, mu, sigma = np.nan, np.nan, np.nan
+        if result.success:
+            theta, mu, sigma = float(result.x[0]), float(result.x[1]), float(result.x[2])
+        else:
+            # Fallback to initial estimates if optimization fails
+            theta, mu, sigma = initial_params
+
+        # Recalculate likelihood and get residuals with optimal params
+        # Note: For Kalman filter, residuals are actually innovation residuals, not
+        # the simple conditional Gaussian residuals. For simplicity, we reuse
+        # _calculate_ou_log_likelihood_and_residuals here, but this is a simplification.
+        log_likelihood, residuals = self._calculate_ou_log_likelihood_and_residuals(data, dt, theta, mu, sigma) 
+        
+        # Standard errors from numerical inverse Hessian of the optimizer result
+        param_ses: Dict[str, float] = {}
+        if hasattr(result, 'hess_inv') and result.hess_inv is not None:
+            if callable(getattr(result.hess_inv, 'todense', None)):
+                cov_matrix = np.asarray(result.hess_inv.todense())
+            else:
+                cov_matrix = np.asarray(result.hess_inv)
+            if cov_matrix.shape == (3, 3):
+                param_ses = {
+                    'theta': float(np.sqrt(max(0, cov_matrix[0, 0]))),
+                    'mu': float(np.sqrt(max(0, cov_matrix[1, 1]))),
+                    'sigma': float(np.sqrt(max(0, cov_matrix[2, 2]))),
+                }
+            else:
+                param_ses = {'theta': np.nan, 'mu': np.nan, 'sigma': np.nan}
+        else:
+            param_ses = {'theta': np.nan, 'mu': np.nan, 'sigma': np.nan}
+
+
+        return theta, mu, sigma, param_ses, log_likelihood, residuals
+
+    @staticmethod
+    def _kalman_filter_log_likelihood(params: np.ndarray, y: np.ndarray, dt: float) -> float:
+        """
+        Calculates the negative log-likelihood of observations `y` using the Kalman Filter
+        for an OU process with parameters `params = [theta, mu, sigma]`.
+        Assumes direct observation of the state, i.e., Y_t = X_t (no observation noise).
+
+        State equation: X_t+1 = F * X_t + U + W_t, with W_t ~ N(0, Q)
+        Observation equation: Y_t = H * X_t + V_t, with V_t ~ N(0, R) (here R=0)
+        """
+        theta, mu, sigma = params
+        
+        if theta <= 0 or sigma <= 0:
+            return np.inf
+
+        n_obs = len(y)
+        
+        # Transition matrix (scalar for OU)
+        F = np.exp(-theta * dt)
+        
+        # Control input (deterministic part)
+        U = mu * (1 - F)
+        
+        # Process noise covariance (Q)
+        Q = sigma ** 2 * (1 - np.exp(-2 * theta * dt)) / (2 * theta)
+        
+        if Q <= 0: # Ensure Q is positive
+            return np.inf
+
+        # Observation matrix (Y_t = X_t)
+        H = 1.0
+        # Observation noise covariance (R) - assume zero for now (direct observation)
+        R = 1e-12 # A very small number to represent practically zero observation noise, avoid division by zero
+
+        # Initialize Kalman Filter
+        x_hat = y[0] # Initial state estimate
+        P = Q        # Initial state covariance (assume steady state)
+
+        log_likelihood = 0.0
+        
+        for i in range(1, n_obs):
+            # Prediction Step
+            x_pred = F * x_hat + U
+            P_pred = F * P * F + Q
+
+            # Update Step
+            # Innovation (measurement residual)
+            innovation = y[i] - H * x_pred
+            
+            # Innovation covariance
+            S = H * P_pred * H + R
+            
+            if S <= 0: # Ensure innovation covariance is positive
+                return np.inf
+
+            # Kalman Gain
+            K = P_pred * H / S
+
+            # Update state estimate
+            x_hat = x_pred + K * innovation
+
+            # Update state covariance
+            P = (1 - K * H) * P_pred
+            
+            # Add log-likelihood contribution
+            log_likelihood += -0.5 * np.log(2 * np.pi * S) - 0.5 * (innovation ** 2 / S)
+
+        return -log_likelihood # Return negative log-likelihood for minimization
+
+    def _calculate_ou_log_likelihood_and_residuals(self, data: pd.Series, dt: float, theta: float, mu: float, sigma: float) -> Tuple[float, np.ndarray]:
+        """Calculates log-likelihood and residuals for OU Process."""
+        x_t = data.iloc[:-1].values
+        x_t_plus_dt = data.iloc[1:].values
+        n = len(x_t)
+
+        if theta <= 0 or sigma <= 0:
+            warnings.warn("Theta or Sigma is non-positive, log-likelihood and residuals might be inaccurate.", RuntimeWarning)
+            return -np.inf, np.full(n, np.nan)
+
+        # Conditional mean and variance for X_{t+dt} | X_t
+        exp_minus_theta_dt = np.exp(-theta * dt)
+        conditional_mean = x_t * exp_minus_theta_dt + mu * (1 - exp_minus_theta_dt)
+        conditional_variance = sigma ** 2 * (1 - np.exp(-2 * theta * dt)) / (2 * theta)
+
+        if conditional_variance <= 0:
+            warnings.warn("Conditional variance is non-positive, log-likelihood and residuals might be inaccurate.", RuntimeWarning)
+            return -np.inf, np.full(n, np.nan)
+
+        log_likelihood = np.sum(stats.norm.logpdf(x_t_plus_dt, loc=conditional_mean, scale=np.sqrt(conditional_variance)))
+        residuals = (x_t_plus_dt - conditional_mean) / np.sqrt(conditional_variance)
+
+        return log_likelihood, residuals
 
     def _jackknife_bias_correction(
         self,
@@ -308,7 +485,7 @@ class OUProcess(StochasticProcess):
         theta_full: float,
         mu_full: float,
         sigma_full: float,
-    ) -> tuple:
+    ) -> Tuple[float, float, float]:
         """
         Delete-1 jackknife bias correction for OU parameters.
 
@@ -381,7 +558,7 @@ class OUProcess(StochasticProcess):
 
     def sample(self, n_paths: int = 1, horizon: int = 1, dt: Optional[float] = None) -> KestrelResult:
         """
-        Simulates future paths using Euler-Maruyama method.
+        Simulates future paths using the exact transition density.
 
         Parameters
         ----------
@@ -414,18 +591,43 @@ class OUProcess(StochasticProcess):
 
         if any(p is None for p in [theta, mu, sigma]):
             raise RuntimeError("OU parameters (theta, mu, sigma) must be set or estimated to sample.")
+        
+        if theta <= 0:
+            warnings.warn(f"Theta ({theta}) must be positive for exact OU sampling formula. Falling back to Euler-Maruyama.", RuntimeWarning)
+            # Fallback to Euler-Maruyama if theta is non-positive
+            paths = np.zeros((horizon + 1, n_paths))
+            if self.is_fitted and hasattr(self, '_last_data_point'):
+                initial_val = self._last_data_point
+                paths[0, :] = initial_val
+            else:
+                initial_val = mu
+                paths[0, :] = initial_val
+
+            for t in range(horizon):
+                dW = np.random.normal(loc=0.0, scale=np.sqrt(dt), size=n_paths)
+                paths[t + 1, :] = paths[t, :] + theta * (mu - paths[t, :]) * dt + sigma * dW
+            return KestrelResult(pd.DataFrame(paths), initial_value=initial_val)
 
         paths = np.zeros((horizon + 1, n_paths))
         if self.is_fitted and hasattr(self, '_last_data_point'):
             initial_val = self._last_data_point
             paths[0, :] = initial_val
         else:
-            initial_val = mu
+            initial_val = mu # Start at mean if not fitted
             paths[0, :] = initial_val
 
-        # Euler-Maruyama simulation
+        # Exact simulation using transition density
+        # X_{t+dt} = X_t * e^{-theta*dt} + mu * (1 - e^{-theta*dt}) + sigma_t * epsilon
+        # where sigma_t = sigma * sqrt((1 - e^{-2*theta*dt}) / (2*theta))
+        exp_minus_theta_dt = np.exp(-theta * dt)
+        
+        # This is the conditional standard deviation of X_{t+dt} given X_t
+        sigma_sd_term = sigma * np.sqrt((1 - np.exp(-2 * theta * dt)) / (2 * theta))
+
         for t in range(horizon):
-            dW = np.random.normal(loc=0.0, scale=np.sqrt(dt), size=n_paths)
-            paths[t + 1, :] = paths[t, :] + theta * (mu - paths[t, :]) * dt + sigma * dW
+            epsilon = np.random.normal(loc=0.0, scale=1.0, size=n_paths)
+            paths[t + 1, :] = (paths[t, :] * exp_minus_theta_dt +
+                               mu * (1 - exp_minus_theta_dt) +
+                               sigma_sd_term * epsilon)
 
         return KestrelResult(pd.DataFrame(paths), initial_value=initial_val)

@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import warnings
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 from scipy.optimize import minimize
 
 from kestrel.base import StochasticProcess
@@ -22,7 +23,7 @@ class CIRProcess(StochasticProcess):
     Models mean-reverting dynamics with state-dependent volatility.
     SDE: dX_t = kappa * (theta - X_t) dt + sigma * sqrt(X_t) dW_t
 
-    Feller condition (2*kappa*theta > sigma^2) ensures strict positivity.
+    Feller condition (2*kappa*theta >= sigma^2) ensures strict positivity.
 
     Parameters
     ----------
@@ -52,7 +53,7 @@ class CIRProcess(StochasticProcess):
         bias_correction: bool = False,
         feller_constraint: bool = False,
         regularization: Optional[float] = None,
-    ) -> None:
+    ) -> KestrelResult:
         """
         Estimates (kappa, theta, sigma) from time-series data.
 
@@ -80,6 +81,11 @@ class CIRProcess(StochasticProcess):
         ------
         ValueError
             If data not pandas Series, contains non-positive values, or unknown method.
+
+        Returns
+        -------
+        KestrelResult
+            An object containing estimation results, diagnostics, and potentially simulated paths.
         """
         if not isinstance(data, pd.Series):
             raise ValueError("Input data must be a pandas Series.")
@@ -92,39 +98,48 @@ class CIRProcess(StochasticProcess):
             dt = self._infer_dt(data)
 
         self.dt_ = dt
+        n_obs = len(data) - 1
 
         if method == 'mle':
-            param_ses = self._fit_mle(data, dt, feller_constraint=feller_constraint, regularization=regularization)
+            kappa, theta, sigma, param_ses, log_likelihood, residuals = self._fit_mle(
+                data, dt, feller_constraint=feller_constraint, regularization=regularization
+            )
             if bias_correction:
+                # Analytical first-order correction for MLE
                 n = len(data) - 1
-                self.kappa = float(self.kappa * n / (n + 3))
-                self._bias_corrected_ = True
+                kappa = float(kappa * n / (n + 3))
+                # self._bias_corrected_ = True # No longer set on self
             else:
-                self._bias_corrected_ = False
+                pass
+                # self._bias_corrected_ = False # No longer set on self
         elif method == 'lsq':
-            param_ses = self._fit_lsq(data, dt, feller_constraint=feller_constraint)
+            kappa, theta, sigma, param_ses, log_likelihood, residuals = self._fit_lsq(
+                data, dt, feller_constraint=feller_constraint
+            )
             if bias_correction:
-                self._apply_lsq_jackknife_bias_correction(data, dt)
-                self._bias_corrected_ = True
+                kappa = self._apply_lsq_jackknife_bias_correction(data, dt, kappa, theta, sigma)
+                # self._bias_corrected_ = True # No longer set on self
             else:
-                self._bias_corrected_ = False
+                pass
+                # self._bias_corrected_ = False # No longer set on self
         else:
             raise ValueError(f"Unknown estimation method: {method}. Choose 'mle' or 'lsq'.")
 
-        self._set_params(
+        self.kappa = kappa # Store on self for sample method if not passed explicitly
+        self.theta = theta
+        self.sigma = sigma
+
+        self._post_fit_setup(
             last_data_point=data.iloc[-1],
-            kappa=self.kappa,
-            theta=self.theta,
-            sigma=self.sigma,
             dt=self.dt_,
-            param_ses=param_ses
+            freq=None
         )
 
         # Check Feller condition and warn if violated
-        self._feller_satisfied_ = self.feller_condition_satisfied()
-        if not self._feller_satisfied_:
-            feller_lhs = 2 * self.kappa * self.theta
-            feller_rhs = self.sigma ** 2
+        feller_satisfied = self.feller_condition_satisfied(kappa, theta, sigma)
+        if not feller_satisfied:
+            feller_lhs = 2 * kappa * theta
+            feller_rhs = sigma ** 2
             warnings.warn(
                 f"Fitted CIR parameters violate the Feller condition: "
                 f"2*kappa*theta={feller_lhs:.6f} <= sigma^2={feller_rhs:.6f}. "
@@ -134,7 +149,18 @@ class CIRProcess(StochasticProcess):
                 stacklevel=2,
             )
 
-    def _fit_mle(self, data: pd.Series, dt: float, feller_constraint: bool = False, regularization: Optional[float] = None) -> Dict[str, float]:
+        return KestrelResult(
+            process_name="CIRProcess",
+            params={'kappa': kappa, 'theta': theta, 'sigma': sigma},
+            param_ses=param_ses,
+            log_likelihood=log_likelihood,
+            residuals=residuals,
+            n_obs=n_obs,
+        )
+
+    def _fit_mle(
+        self, data: pd.Series, dt: float, feller_constraint: bool = False, regularization: Optional[float] = None
+    ) -> Tuple[float, float, float, Dict[str, float], float, np.ndarray]:
         """
         Estimates CIR parameters using Maximum Likelihood.
 
@@ -171,33 +197,41 @@ class CIRProcess(StochasticProcess):
                 'fun': lambda p: 2 * p[0] * p[1] - p[2] ** 2 - 1e-8,
             }]
             result = minimize(
-                self._neg_log_likelihood,
+                self._neg_log_likelihood_and_residuals,
                 initial_params,
-                args=(x, dt, reg),
+                args=(x, dt, reg, True), # Pass True to return only NLL
                 bounds=bounds,
                 method='SLSQP',
                 constraints=constraints,
             )
         else:
             result = minimize(
-                self._neg_log_likelihood,
+                self._neg_log_likelihood_and_residuals,
                 initial_params,
-                args=(x, dt, reg),
+                args=(x, dt, reg, True), # Pass True to return only NLL
                 bounds=bounds,
                 method='L-BFGS-B',
             )
-
+        
+        kappa, theta, sigma = np.nan, np.nan, np.nan
         if result.success:
-            self.kappa, self.theta, self.sigma = result.x
+            kappa, theta, sigma = result.x
         else:
             # Fallback to LSQ estimates
-            self._fit_lsq_internal(data, dt)
+            kappa, theta, sigma, _, _, _ = self._fit_lsq_internal(data, dt)
+
+
+        # Re-evaluate NLL and get residuals with optimal params
+        nll, residuals = self._neg_log_likelihood_and_residuals(
+            [kappa, theta, sigma], x, dt, reg, False # Pass False to return NLL and residuals
+        )
+        log_likelihood = -nll
 
         # Compute standard errors from inverse Hessian
         param_ses = self._compute_standard_errors(result, ['kappa', 'theta', 'sigma'])
-        return param_ses
+        return kappa, theta, sigma, param_ses, log_likelihood, residuals
 
-    def _neg_log_likelihood(self, params: List[float], x: np.ndarray, dt: float, reg: float = 0.0) -> float:
+    def _neg_log_likelihood_and_residuals(self, params: List[float], x: np.ndarray, dt: float, reg: float = 0.0, only_nll: bool = False) -> Tuple[float, Optional[np.ndarray]]:
         """
         Negative log-likelihood for CIR using Gaussian approximation.
 
@@ -209,10 +243,11 @@ class CIRProcess(StochasticProcess):
         kappa, theta, sigma = params
 
         if kappa <= 0 or theta <= 0 or sigma <= 0:
-            return np.inf
+            return np.inf, None
 
         n = len(x)
         ll = 0.0
+        residuals_list = []
 
         for i in range(1, n):
             x_prev = x[i - 1]
@@ -226,18 +261,32 @@ class CIRProcess(StochasticProcess):
             var_cond = (sigma ** 2 * x_prev * (1 - exp_kdt ** 2)) / (2 * kappa)
 
             if var_cond <= 1e-12:
-                return np.inf
+                # If variance is too small, assume log-likelihood is -inf for this point
+                ll += -1e10 # A large negative number to effectively make NLL inf
+                if not only_nll:
+                    residuals_list.append(np.nan)
+                continue
 
             # Gaussian log-likelihood contribution
-            ll += -0.5 * np.log(2 * np.pi * var_cond)
-            ll += -0.5 * ((x_curr - mean_cond) ** 2 / var_cond)
+            log_pdf_val = stats.norm.logpdf(x_curr, loc=mean_cond, scale=np.sqrt(var_cond))
+            if np.isinf(log_pdf_val): # Handle cases where logpdf returns -inf
+                ll += -1e10
+            else:
+                ll += log_pdf_val
+
+            if not only_nll:
+                residuals_list.append((x_curr - mean_cond) / np.sqrt(var_cond))
 
         nll = -ll
         if reg > 0:
             nll += reg * (kappa ** 2 + theta ** 2)
-        return nll
+        
+        if only_nll:
+            return nll, None
+        else:
+            return nll, np.array(residuals_list)
 
-    def _fit_lsq(self, data: pd.Series, dt: float, feller_constraint: bool = False) -> Dict[str, float]:
+    def _fit_lsq(self, data: pd.Series, dt: float, feller_constraint: bool = False) -> Tuple[float, float, float, Dict[str, float], float, np.ndarray]:
         """
         Estimates CIR parameters using Least Squares regression.
 
@@ -247,20 +296,25 @@ class CIRProcess(StochasticProcess):
         if len(data) < 2:
             raise ValueError("LSQ estimation requires at least 2 data points.")
 
-        param_ses = self._fit_lsq_internal(data, dt)
+        kappa, theta, sigma, param_ses, log_likelihood, residuals = self._fit_lsq_internal(data, dt)
 
         # Post-hoc Feller projection: scale sigma down if needed
-        if feller_constraint and not self.feller_condition_satisfied():
-            max_sigma = np.sqrt(2 * self.kappa * self.theta - 1e-8)
+        if feller_constraint and not self.feller_condition_satisfied(kappa, theta, sigma):
+            max_sigma = np.sqrt(2 * kappa * theta - 1e-8)
             if max_sigma > 0:
-                self.sigma = float(max_sigma)
+                sigma = float(max_sigma)
             else:
                 # kappa*theta too small; cannot satisfy Feller
-                self.sigma = 1e-6
+                sigma = 1e-6
+            # Recalculate log-likelihood and residuals with adjusted sigma
+            nll, residuals = self._neg_log_likelihood_and_residuals(
+                [kappa, theta, sigma], data.values, dt, 0.0, False
+            )
+            log_likelihood = -nll
 
-        return param_ses
+        return kappa, theta, sigma, param_ses, log_likelihood, residuals
 
-    def _fit_lsq_internal(self, data: pd.Series, dt: float) -> Dict[str, float]:
+    def _fit_lsq_internal(self, data: pd.Series, dt: float) -> Tuple[float, float, float, Dict[str, float], float, np.ndarray]:
         """Internal LSQ implementation."""
         x = data.values
         n = len(x) - 1
@@ -272,13 +326,13 @@ class CIRProcess(StochasticProcess):
         # Regression: dx = alpha + beta * x_t + epsilon
         # where alpha = kappa * theta * dt, beta = -kappa * dt
         X_reg = np.vstack([np.ones(n), x_t]).T
-        beta_hat, residuals, rank, s = np.linalg.lstsq(X_reg, dx, rcond=None)
+        beta_hat, residuals_ols, rank, s = np.linalg.lstsq(X_reg, dx, rcond=None)
 
         alpha, beta = beta_hat[0], beta_hat[1]
 
         # Map to CIR parameters
-        self.kappa = max(1e-6, -beta / dt)
-        self.theta = alpha / (self.kappa * dt) if self.kappa > 1e-6 else float(np.mean(x))
+        kappa = max(1e-6, -beta / dt)
+        theta = alpha / (kappa * dt) if kappa > 1e-6 else float(np.mean(x))
 
         # Estimate sigma from residual variance
         epsilon = dx - (alpha + beta * x_t)
@@ -287,9 +341,10 @@ class CIRProcess(StochasticProcess):
         # For CIR: Var(epsilon) approx sigma^2 * E[X_t] * dt
         mean_x = float(np.mean(x_t))
         sigma_sq = sigma_sq_eps / (mean_x * dt) if mean_x > 0 else sigma_sq_eps / dt
-        self.sigma = max(1e-6, np.sqrt(sigma_sq))
+        sigma = max(1e-6, np.sqrt(sigma_sq))
 
         # Compute standard errors
+        param_ses: Dict[str, float] = {}
         try:
             cov_beta = np.linalg.inv(X_reg.T @ X_reg) * sigma_sq_eps
             se_alpha = float(np.sqrt(cov_beta[0, 0]))
@@ -297,12 +352,20 @@ class CIRProcess(StochasticProcess):
 
             # Delta method for kappa and theta
             se_kappa = float(np.abs(-1 / dt) * se_beta)
-            se_theta = float(se_alpha / (self.kappa * dt)) if self.kappa > 1e-6 else np.nan
-            se_sigma = float(self.sigma / np.sqrt(2 * n))
+            se_theta = float(se_alpha / (kappa * dt)) if kappa > 1e-6 else np.nan
+            se_sigma = float(sigma / np.sqrt(2 * n))
+            param_ses = {'kappa': se_kappa, 'theta': se_theta, 'sigma': se_sigma}
         except np.linalg.LinAlgError:
-            se_kappa, se_theta, se_sigma = np.nan, np.nan, np.nan
+            warnings.warn("Could not invert (X_reg.T @ X_reg) for standard errors in LSQ.", RuntimeWarning)
+            param_ses = {'kappa': np.nan, 'theta': np.nan, 'sigma': np.nan}
+        
+        # Calculate log-likelihood and residuals based on final parameters
+        nll, residuals = self._neg_log_likelihood_and_residuals(
+            [kappa, theta, sigma], data.values, dt, 0.0, False
+        )
+        log_likelihood = -nll
 
-        return {'kappa': se_kappa, 'theta': se_theta, 'sigma': se_sigma}
+        return kappa, theta, sigma, param_ses, log_likelihood, residuals
 
     def _compute_standard_errors(self, result: Any, param_names: List[str]) -> Dict[str, float]:
         """Computes standard errors from optimisation result."""
@@ -325,7 +388,7 @@ class CIRProcess(StochasticProcess):
 
         return param_ses
 
-    def _apply_lsq_jackknife_bias_correction(self, data: pd.Series, dt: float) -> None:
+    def _apply_lsq_jackknife_bias_correction(self, data: pd.Series, dt: float, kappa_full: float, theta_full: float, sigma_full: float) -> float:
         """
         Delete-1 jackknife bias correction for CIR LSQ estimates.
 
@@ -336,8 +399,6 @@ class CIRProcess(StochasticProcess):
         n = len(x) - 1
         x_t = x[:-1]
         dx = x[1:] - x_t
-
-        kappa_full, theta_full, sigma_full = self.kappa, self.theta, self.sigma
 
         kappa_loo = np.empty(n)
         valid = np.ones(n, dtype=bool)
@@ -361,9 +422,10 @@ class CIRProcess(StochasticProcess):
 
         n_valid = valid.sum()
         if n_valid < n * 0.5:
-            return
+            return kappa_full
 
-        self.kappa = float(max(1e-6, n * kappa_full - (n - 1) * np.mean(kappa_loo[valid])))
+        kappa_jk = float(max(1e-6, n * kappa_full - (n - 1) * np.mean(kappa_loo[valid])))
+        return kappa_jk
 
     def sample(self, n_paths: int = 1, horizon: int = 1, dt: Optional[float] = None) -> KestrelResult:
         """
@@ -415,15 +477,15 @@ class CIRProcess(StochasticProcess):
 
         return KestrelResult(pd.DataFrame(paths), initial_value=initial_val)
 
-    def feller_condition_satisfied(self) -> bool:
+    def feller_condition_satisfied(self, kappa: Optional[float] = None, theta: Optional[float] = None, sigma: Optional[float] = None) -> bool:
         """
         Checks if Feller condition (2*kappa*theta > sigma^2) is satisfied.
 
         Returns True if process is guaranteed to stay strictly positive.
         """
-        kappa = self.kappa_ if self.is_fitted else self.kappa
-        theta = self.theta_ if self.is_fitted else self.theta
-        sigma = self.sigma_ if self.is_fitted else self.sigma
+        kappa = self.kappa_ if kappa is None and self.is_fitted else kappa
+        theta = self.theta_ if theta is None and self.is_fitted else theta
+        sigma = self.sigma_ if sigma is None and self.is_fitted else sigma
 
         if any(p is None for p in [kappa, theta, sigma]):
             return False

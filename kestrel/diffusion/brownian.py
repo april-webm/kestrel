@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+import warnings
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
+from scipy.optimize import minimize as sp_minimize # Import for GMM
 
 from kestrel.base import StochasticProcess
 from kestrel.utils.fisher_information import bm_fisher_information, gbm_fisher_information
@@ -41,7 +44,7 @@ class BrownianMotion(StochasticProcess):
         dt: Optional[float] = None,
         method: str = 'mle',
         regularization: Optional[float] = None,
-    ) -> None:
+    ) -> KestrelResult:
         """
         Estimates (mu, sigma) from time-series data.
 
@@ -52,7 +55,7 @@ class BrownianMotion(StochasticProcess):
         dt : float, optional
             Time step between observations.
         method : str
-            Estimation method: 'mle' or 'moments'.
+            Estimation method: 'mle', 'moments', or 'gmm'.
         regularization : float, optional
             L2 penalty strength on drift parameter mu. When set, the estimator
             becomes the MAP estimate under a Gaussian prior. Closed-form Ridge
@@ -62,6 +65,11 @@ class BrownianMotion(StochasticProcess):
         ------
         ValueError
             If data not pandas Series or unknown method.
+
+        Returns
+        -------
+        KestrelResult
+            An object containing estimation results, diagnostics, and potentially simulated paths.
         """
         if not isinstance(data, pd.Series):
             raise ValueError("Input data must be a pandas Series.")
@@ -70,23 +78,38 @@ class BrownianMotion(StochasticProcess):
             dt = self._infer_dt(data)
 
         self.dt_ = dt
+        n_obs = len(data) - 1
 
         if method == 'mle':
-            param_ses = self._fit_mle(data, dt, regularization=regularization)
+            mu, sigma, param_ses = self._fit_mle(data, dt, regularization=regularization)
         elif method == 'moments':
-            param_ses = self._fit_moments(data, dt)
+            mu, sigma, param_ses = self._fit_moments(data, dt)
+        elif method == 'gmm':
+            mu, sigma, param_ses = self._fit_gmm(data, dt)
         else:
-            raise ValueError(f"Unknown estimation method: {method}. Choose 'mle' or 'moments'.")
+            raise ValueError(f"Unknown estimation method: {method}. Choose 'mle', 'moments', or 'gmm'.")
 
-        self._set_params(
+        self.mu = mu  # Store on self for sample method if not passed explicitly
+        self.sigma = sigma # Store on self for sample method if not passed explicitly
+
+        log_likelihood, residuals = self._calculate_bm_log_likelihood_and_residuals(data, dt, mu, sigma)
+
+        self._post_fit_setup(
             last_data_point=data.iloc[-1],
-            mu=self.mu,
-            sigma=self.sigma,
             dt=self.dt_,
-            param_ses=param_ses
+            freq=None # No frequency inference for BM
         )
 
-    def _fit_mle(self, data: pd.Series, dt: float, regularization: Optional[float] = None) -> Dict[str, float]:
+        return KestrelResult(
+            process_name="BrownianMotion",
+            params={'mu': mu, 'sigma': sigma},
+            param_ses=param_ses,
+            log_likelihood=log_likelihood,
+            residuals=residuals,
+            n_obs=n_obs,
+        )
+
+    def _fit_mle(self, data: pd.Series, dt: float, regularization: Optional[float] = None) -> Tuple[float, float, Dict[str, float]]:
         """Estimates parameters using Maximum Likelihood."""
         if len(data) < 2:
             raise ValueError("MLE estimation requires at least 2 data points.")
@@ -96,21 +119,21 @@ class BrownianMotion(StochasticProcess):
         n = len(dx)
 
         # Sigma estimate (unaffected by regularization on mu)
-        self.sigma = float(np.sqrt(np.var(dx, ddof=1) / dt))
+        sigma = float(np.sqrt(np.var(dx, ddof=1) / dt))
 
         # MLE / Ridge estimate for mu
         if regularization is not None and regularization > 0:
             # Penalised MLE: argmin_mu sum((dx_i - mu*dt)^2)/(2*sigma^2*dt) + lambda*mu^2
             # Closed-form: mu = sum(dx) / (n*dt + 2*lambda*sigma^2*dt)
-            self.mu = float(np.sum(dx) / (n * dt + 2 * regularization * self.sigma ** 2 * dt))
+            mu = float(np.sum(dx) / (n * dt + 2 * regularization * sigma ** 2 * dt))
         else:
-            self.mu = float(np.mean(dx) / dt)
+            mu = float(np.mean(dx) / dt)
 
         # Standard errors from Fisher Information
-        self._fisher_information_, param_ses = bm_fisher_information(self.sigma, dt, n)
-        return param_ses
+        _, param_ses = bm_fisher_information(sigma, dt, n)
+        return mu, sigma, param_ses
 
-    def _fit_moments(self, data: pd.Series, dt: float) -> Dict[str, float]:
+    def _fit_moments(self, data: pd.Series, dt: float) -> Tuple[float, float, Dict[str, float]]:
         """Estimates parameters using method of moments."""
         if len(data) < 2:
             raise ValueError("Moments estimation requires at least 2 data points.")
@@ -120,14 +143,99 @@ class BrownianMotion(StochasticProcess):
         n = len(dx)
 
         # First moment: E[dX] = mu * dt
-        self.mu = float(np.mean(dx) / dt)
+        mu = float(np.mean(dx) / dt)
 
         # Second moment: Var[dX] = sigma^2 * dt
-        self.sigma = float(np.sqrt(np.var(dx, ddof=1) / dt))
+        sigma = float(np.sqrt(np.var(dx, ddof=1) / dt))
 
         # Standard errors from Fisher Information
-        self._fisher_information_, param_ses = bm_fisher_information(self.sigma, dt, n)
-        return param_ses
+        _, param_ses = bm_fisher_information(sigma, dt, n)
+        return mu, sigma, param_ses
+
+    def _fit_gmm(self, data: pd.Series, dt: float) -> Tuple[float, float, Dict[str, float]]:
+        """
+        Estimates Brownian Motion parameters using Generalized Method of Moments (GMM).
+        Uses first two raw moments of increments.
+        """
+        if len(data) < 2:
+            raise ValueError("GMM estimation requires at least 2 data points.")
+
+        dx = np.diff(data.values)
+        n = len(dx)
+
+        # Initial parameter estimates from method of moments
+        mu0, sigma0, _ = self._fit_moments(data, dt)
+        initial_params = [mu0, sigma0]
+        bounds = [(None, None), (1e-6, None)] # sigma > 0
+
+        # Minimize the GMM objective function
+        result = sp_minimize(
+            self._gmm_objective_function,
+            initial_params,
+            args=(dx, dt),
+            bounds=bounds,
+            method='L-BFGS-B',
+            options={'maxiter': 1000}
+        )
+
+        mu, sigma = np.nan, np.nan
+        if result.success:
+            mu, sigma = float(result.x[0]), float(result.x[1])
+        else:
+            mu, sigma = initial_params # Fallback to initial estimates
+
+        # Standard errors from Fisher Information (for comparability, though GMM has its own SEs)
+        _, param_ses = bm_fisher_information(sigma, dt, n)
+        return mu, sigma, param_ses
+
+    @staticmethod
+    def _gmm_objective_function(params: np.ndarray, dx: np.ndarray, dt: float) -> float:
+        """
+        GMM objective function for Brownian Motion.
+        Moments: E[dX] = mu*dt, E[(dX)^2] = (mu*dt)^2 + sigma^2*dt
+        """
+        mu, sigma = params
+
+        if sigma <= 0: # Constraint check
+            return np.inf
+
+        # Sample moments
+        sample_moment1 = np.mean(dx)
+        sample_moment2 = np.mean(dx**2)
+
+        # Theoretical moments
+        theoretical_moment1 = mu * dt
+        theoretical_moment2 = (mu * dt)**2 + sigma**2 * dt
+
+        # Moment conditions (g(params, data) = 0)
+        g1 = sample_moment1 - theoretical_moment1
+        g2 = sample_moment2 - theoretical_moment2
+        
+        # Simple identity weighting matrix for now (minimizes sum of squares)
+        # For a full GMM, this would be optimal weighting matrix W = S_hat_inv
+        objective = g1**2 + g2**2
+        return objective
+
+
+    def _calculate_bm_log_likelihood_and_residuals(self, data: pd.Series, dt: float, mu: float, sigma: float) -> Tuple[float, np.ndarray]:
+        """Calculates log-likelihood and residuals for Brownian Motion."""
+        x = data.values
+        dx = np.diff(x)
+        n = len(dx)
+
+        if sigma <= 0:
+            # Fallback for log_likelihood calculation in case sigma is problematic
+            warnings.warn("Sigma is non-positive, log-likelihood and residuals might be inaccurate.", RuntimeWarning)
+            return -np.inf, np.full(n, np.nan)
+
+        # Log-likelihood
+        loc = mu * dt
+        scale = sigma * np.sqrt(dt)
+        log_likelihood = np.sum(norm.logpdf(dx, loc=loc, scale=scale))
+
+        # Residuals
+        residuals = (dx - loc) / scale
+        return log_likelihood, residuals
 
     def sample(self, n_paths: int = 1, horizon: int = 1, dt: Optional[float] = None) -> KestrelResult:
         """
@@ -205,7 +313,7 @@ class GeometricBrownianMotion(StochasticProcess):
         dt: Optional[float] = None,
         method: str = 'mle',
         regularization: Optional[float] = None,
-    ) -> None:
+    ) -> KestrelResult:
         """
         Estimates (mu, sigma) from price time-series.
 
@@ -225,6 +333,11 @@ class GeometricBrownianMotion(StochasticProcess):
         ------
         ValueError
             If data not pandas Series, contains non-positive values, or unknown method.
+
+        Returns
+        -------
+        KestrelResult
+            An object containing estimation results, diagnostics, and potentially simulated paths.
         """
         if not isinstance(data, pd.Series):
             raise ValueError("Input data must be a pandas Series.")
@@ -236,21 +349,34 @@ class GeometricBrownianMotion(StochasticProcess):
             dt = self._infer_dt(data)
 
         self.dt_ = dt
+        n_obs = len(data) - 1
 
         if method == 'mle':
-            param_ses = self._fit_mle(data, dt, regularization=regularization)
+            mu, sigma, param_ses = self._fit_mle(data, dt, regularization=regularization)
         else:
             raise ValueError(f"Unknown estimation method: {method}. Choose 'mle'.")
 
-        self._set_params(
+        self.mu = mu # Store on self for sample method if not passed explicitly
+        self.sigma = sigma # Store on self for sample method if not passed explicitly
+
+        log_likelihood, residuals = self._calculate_gbm_log_likelihood_and_residuals(data, dt, mu, sigma)
+
+        self._post_fit_setup(
             last_data_point=data.iloc[-1],
-            mu=self.mu,
-            sigma=self.sigma,
             dt=self.dt_,
-            param_ses=param_ses
+            freq=None # No frequency inference for GBM
         )
 
-    def _fit_mle(self, data: pd.Series, dt: float, regularization: Optional[float] = None) -> Dict[str, float]:
+        return KestrelResult(
+            process_name="GeometricBrownianMotion",
+            params={'mu': mu, 'sigma': sigma},
+            param_ses=param_ses,
+            log_likelihood=log_likelihood,
+            residuals=residuals,
+            n_obs=n_obs,
+        )
+
+    def _fit_mle(self, data: pd.Series, dt: float, regularization: Optional[float] = None) -> Tuple[float, float, Dict[str, float]]:
         """Estimates parameters using Maximum Likelihood on log-returns."""
         if len(data) < 2:
             raise ValueError("MLE estimation requires at least 2 data points.")
@@ -264,19 +390,40 @@ class GeometricBrownianMotion(StochasticProcess):
         var_r = np.var(log_returns, ddof=1)
 
         # Estimate sigma from variance (unaffected by regularization)
-        self.sigma = float(np.sqrt(var_r / dt))
+        sigma = float(np.sqrt(var_r / dt))
 
         # Estimate mu
         if regularization is not None and regularization > 0:
             # Ridge on alpha = mu - 0.5*sigma^2 in log-return space
-            alpha_penalized = float(np.sum(log_returns) / (n * dt + 2 * regularization * self.sigma ** 2 * dt))
-            self.mu = float(alpha_penalized + 0.5 * self.sigma ** 2)
+            alpha_penalized = float(np.sum(log_returns) / (n * dt + 2 * regularization * sigma ** 2 * dt))
+            mu = float(alpha_penalized + 0.5 * sigma ** 2)
         else:
-            self.mu = float(mean_r / dt + 0.5 * self.sigma ** 2)
+            mu = float(mean_r / dt + 0.5 * sigma ** 2)
 
         # Standard errors from Fisher Information
-        self._fisher_information_, param_ses = gbm_fisher_information(self.mu, self.sigma, dt, n)
-        return param_ses
+        _, param_ses = gbm_fisher_information(mu, sigma, dt, n)
+        return mu, sigma, param_ses
+
+    def _calculate_gbm_log_likelihood_and_residuals(self, data: pd.Series, dt: float, mu: float, sigma: float) -> Tuple[float, np.ndarray]:
+        """Calculates log-likelihood and residuals for Geometric Brownian Motion."""
+        prices = data.values
+        log_returns = np.diff(np.log(prices))
+        n = len(log_returns)
+
+        if sigma <= 0:
+            # Fallback for log_likelihood calculation in case sigma is problematic
+            warnings.warn("Sigma is non-positive, log-likelihood and residuals might be inaccurate.", RuntimeWarning)
+            return -np.inf, np.full(n, np.nan)
+
+        # For GBM, we use the log-returns which are normally distributed
+        alpha = mu - 0.5 * sigma ** 2
+        loc = alpha * dt
+        scale = sigma * np.sqrt(dt)
+        log_likelihood = np.sum(norm.logpdf(log_returns, loc=loc, scale=scale))
+
+        # Residuals are standardized log-returns
+        residuals = (log_returns - loc) / scale
+        return log_likelihood, residuals
 
     def sample(self, n_paths: int = 1, horizon: int = 1, dt: Optional[float] = None) -> KestrelResult:
         """

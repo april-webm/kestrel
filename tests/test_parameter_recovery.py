@@ -5,6 +5,7 @@ import pytest
 import numpy as np
 import pandas as pd
 from kestrel import BrownianMotion, GeometricBrownianMotion, OUProcess, CIRProcess, MertonProcess
+from kestrel.utils.kestrel_result import KestrelResult
 
 
 class TestBrownianMotionRecovery:
@@ -20,10 +21,10 @@ class TestBrownianMotionRecovery:
         data = pd.Series(x)
 
         bm = BrownianMotion()
-        bm.fit(data, dt=dt, method='mle')
+        result = bm.fit(data, dt=dt, method='mle')
 
-        assert abs(bm.mu_ - true_mu) < 3 * bm.mu_se_
-        assert abs(bm.sigma_ - true_sigma) < 3 * bm.sigma_se_
+        assert abs(result.params['mu'] - true_mu) < 3 * result.param_ses['mu']
+        assert abs(result.params['sigma'] - true_sigma) < 3 * result.param_ses['sigma']
 
     def test_recover_bm_params_moments(self):
         np.random.seed(101)
@@ -35,10 +36,10 @@ class TestBrownianMotionRecovery:
         data = pd.Series(x)
 
         bm = BrownianMotion()
-        bm.fit(data, dt=dt, method='moments')
+        result = bm.fit(data, dt=dt, method='moments')
 
-        assert abs(bm.mu_ - true_mu) < 3 * bm.mu_se_
-        assert abs(bm.sigma_ - true_sigma) < 3 * bm.sigma_se_
+        assert abs(result.params['mu'] - true_mu) < 3 * result.param_ses['mu']
+        assert abs(result.params['sigma'] - true_sigma) < 3 * result.param_ses['sigma']
 
 
 class TestGBMRecovery:
@@ -55,9 +56,9 @@ class TestGBMRecovery:
         data = pd.Series(prices)
 
         gbm = GeometricBrownianMotion()
-        gbm.fit(data, dt=dt)
+        result = gbm.fit(data, dt=dt)
 
-        assert abs(gbm.sigma_ - true_sigma) < 3 * gbm.sigma_se_
+        assert abs(result.params['sigma'] - true_sigma) < 3 * result.param_ses['sigma']
 
     def test_gbm_zero_drift(self):
         """Edge case: GBM with zero drift."""
@@ -71,9 +72,9 @@ class TestGBMRecovery:
         data = pd.Series(prices)
 
         gbm = GeometricBrownianMotion()
-        gbm.fit(data, dt=dt)
-        assert gbm.sigma_ > 0
-        assert abs(gbm.sigma_ - true_sigma) < 3 * gbm.sigma_se_
+        result = gbm.fit(data, dt=dt)
+        assert result.params['sigma'] > 0
+        assert abs(result.params['sigma'] - true_sigma) < 3 * result.param_ses['sigma']
 
 
 class TestOURecovery:
@@ -90,12 +91,12 @@ class TestOURecovery:
         data = pd.Series(x)
 
         ou = OUProcess()
-        ou.fit(data, dt=dt, method='mle')
+        result = ou.fit(data, dt=dt, method='mle')
 
         # OU theta estimates are biased in small samples; use generous bounds
-        assert 0.3 < ou.theta_ < 3.0
-        assert abs(ou.mu_ - true_mu) < 1.0
-        assert 0.2 < ou.sigma_ < 1.0
+        assert 0.3 < result.params['theta'] < 3.0
+        assert abs(result.params['mu'] - true_mu) < 1.0
+        assert 0.2 < result.params['sigma'] < 1.0
 
     def test_recover_ou_params_ar1(self):
         """AR1 and MLE should produce identical results (same analytic method)."""
@@ -109,15 +110,15 @@ class TestOURecovery:
         data = pd.Series(x)
 
         ou_mle = OUProcess()
-        ou_mle.fit(data, dt=dt, method='mle')
+        result_mle = ou_mle.fit(data, dt=dt, method='mle')
 
         ou_ar1 = OUProcess()
-        ou_ar1.fit(data, dt=dt, method='ar1')
+        result_ar1 = ou_ar1.fit(data, dt=dt, method='ar1')
 
         # Both methods should produce identical estimates
-        assert ou_mle.theta_ == pytest.approx(ou_ar1.theta_, rel=1e-10)
-        assert ou_mle.mu_ == pytest.approx(ou_ar1.mu_, rel=1e-10)
-        assert ou_mle.sigma_ == pytest.approx(ou_ar1.sigma_, rel=1e-10)
+        assert result_mle.params['theta'] == pytest.approx(result_ar1.params['theta'], rel=1e-10)
+        assert result_mle.params['mu'] == pytest.approx(result_ar1.params['mu'], rel=1e-10)
+        assert result_mle.params['sigma'] == pytest.approx(result_ar1.params['sigma'], rel=1e-10)
 
     def test_ou_fast_mean_reversion(self):
         """Edge case: very fast mean reversion (theta=10)."""
@@ -131,8 +132,8 @@ class TestOURecovery:
         data = pd.Series(x)
 
         ou = OUProcess()
-        ou.fit(data, dt=dt, method='mle')
-        assert ou.theta_ > 1.0
+        result = ou.fit(data, dt=dt, method='mle')
+        assert result.params['theta'] > 1.0
 
     def test_ou_slow_mean_reversion(self):
         """Edge case: very slow mean reversion (theta=0.01)."""
@@ -146,8 +147,8 @@ class TestOURecovery:
         data = pd.Series(x)
 
         ou = OUProcess()
-        ou.fit(data, dt=dt, method='mle')
-        assert ou.theta_ >= 0
+        result = ou.fit(data, dt=dt, method='mle')
+        assert result.params['theta'] >= 0
 
 
 class TestCIRRecovery:
@@ -165,11 +166,11 @@ class TestCIRRecovery:
         data = pd.Series(x)
 
         cir = CIRProcess()
-        cir.fit(data, dt=dt, method='mle')
+        result = cir.fit(data, dt=dt, method='mle')
 
-        assert cir.kappa_ > 0
-        assert cir.theta_ > 0
-        assert cir.sigma_ > 0
+        assert result.params['kappa'] > 0
+        assert result.params['theta'] > 0
+        assert result.params['sigma'] > 0
 
     def test_recover_cir_params_lsq(self):
         np.random.seed(107)
@@ -183,11 +184,11 @@ class TestCIRRecovery:
         data = pd.Series(x)
 
         cir = CIRProcess()
-        cir.fit(data, dt=dt, method='lsq')
+        result = cir.fit(data, dt=dt, method='lsq')
 
-        assert cir.kappa_ > 0
-        assert cir.theta_ > 0
-        assert cir.sigma_ > 0
+        assert result.params['kappa'] > 0
+        assert result.params['theta'] > 0
+        assert result.params['sigma'] > 0
 
     def test_cir_near_feller_boundary(self):
         """Edge case: CIR near Feller condition boundary."""
@@ -203,9 +204,8 @@ class TestCIRRecovery:
         data = pd.Series(x)
 
         cir = CIRProcess()
-        cir.fit(data, dt=dt, method='lsq')
-        assert cir.is_fitted
-
+        result = cir.fit(data, dt=dt, method='lsq')
+        assert cir.is_fitted # is_fitted is still on the model instance
 
 class TestRegressionPinnedSeeds:
     """Pin expected outputs for specific seeds to catch silent regressions."""
@@ -214,6 +214,7 @@ class TestRegressionPinnedSeeds:
         np.random.seed(42)
         bm = BrownianMotion(mu=0.1, sigma=0.3)
         result = bm.sample(n_paths=3, horizon=5, dt=1.0)
+        assert isinstance(result, KestrelResult) # Ensure it's a KestrelResult
         assert result.paths.shape == (6, 3)
         assert np.allclose(result.paths.iloc[0, :].values, [0.0, 0.0, 0.0])
 
@@ -221,18 +222,21 @@ class TestRegressionPinnedSeeds:
         np.random.seed(42)
         gbm = GeometricBrownianMotion(mu=0.1, sigma=0.3)
         result = gbm.sample(n_paths=10, horizon=100, dt=1 / 252)
+        assert isinstance(result, KestrelResult) # Ensure it's a KestrelResult
         assert (result.paths.values > 0).all()
 
     def test_ou_pinned_starts_at_mu(self):
         np.random.seed(42)
         ou = OUProcess(theta=1.0, mu=5.0, sigma=0.5)
         result = ou.sample(n_paths=5, horizon=10, dt=1 / 252)
+        assert isinstance(result, KestrelResult) # Ensure it's a KestrelResult
         assert np.allclose(result.paths.iloc[0, :].values, 5.0)
 
     def test_cir_pinned_non_negative(self):
         np.random.seed(42)
         cir = CIRProcess(kappa=0.5, theta=0.05, sigma=0.1)
         result = cir.sample(n_paths=10, horizon=100, dt=1 / 252)
+        assert isinstance(result, KestrelResult) # Ensure it's a KestrelResult
         assert (result.paths.values >= 0).all()
 
 

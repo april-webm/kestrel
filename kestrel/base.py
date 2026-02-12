@@ -20,24 +20,27 @@ class StochasticProcess(ABC):
     """
 
     _fitted: bool
-    _params: Dict[str, Any]
+    # _params: Dict[str, Any]  # No longer directly store params here; they go in KestrelResult
     _last_data_point: float
     _dt_: float
     _freq_: Optional[str]
 
     def __init__(self) -> None:
         self._fitted = False
-        self._params = {}
+        # self._params = {} # No longer directly store params here
 
     @abstractmethod
-    def fit(self, data: pd.Series, dt: Optional[float] = None, **kwargs: Any) -> None:
+    def fit(self, data: pd.Series, dt: Optional[float] = None, **kwargs: Any) -> KestrelResult:
         """
-        Estimates process parameters from time-series data.
+        Estimates process parameters from time-series data and returns a KestrelResult object.
 
         Args:
             data (pd.Series): Time-series data for model fitting.
             dt (float, optional): Time step between observations.
                                    If None, inferred from data; defaults to 1.0.
+
+        Returns:
+            KestrelResult: An object containing estimation results, diagnostics, and potentially simulated paths.
         """
         pass
 
@@ -66,7 +69,7 @@ class StochasticProcess(ABC):
             inferred_timedelta = data.index[1] - data.index[0]
             current_freq = pd.infer_freq(data.index)
             if current_freq is None:
-                current_freq = 'B'
+                current_freq = 'B' # Default to Business day if not inferrable
 
             if current_freq in ['B', 'C', 'D']:
                 dt = inferred_timedelta / pd.Timedelta(days=252.0)
@@ -84,21 +87,16 @@ class StochasticProcess(ABC):
             return max(dt, 1e-10)
         return 1.0
 
-    def _set_params(
+    # _set_params is refactored. Individual fit methods now populate KestrelResult.
+    def _post_fit_setup(
         self,
         last_data_point: Optional[float] = None,
         dt: Optional[float] = None,
         freq: Optional[str] = None,
-        param_ses: Optional[Dict[str, float]] = None,
-        **kwargs: float,
     ) -> None:
         """
-        Sets estimated parameters, their standard errors, and marks model as fitted.
+        Internal method to set common post-fit attributes.
         """
-        for k, v in kwargs.items():
-            attr_name = k if k.endswith('_') else f"{k}_"
-            setattr(self, attr_name, v)
-            self._params[k] = v
         self._fitted = True
         if last_data_point is not None:
             self._last_data_point = last_data_point
@@ -106,11 +104,6 @@ class StochasticProcess(ABC):
             self._dt_ = dt
         if freq is not None:
             self._freq_ = freq
-        if param_ses is not None:
-            for k, v in param_ses.items():
-                base_key = k.rstrip('_')
-                setattr(self, f"{base_key}_se_", v)
-                self._params[f"{base_key}_se"] = v
 
     @property
     def is_fitted(self) -> bool:
@@ -119,9 +112,3 @@ class StochasticProcess(ABC):
         """
         return self._fitted
 
-    @property
-    def params(self) -> Dict[str, Any]:
-        """
-        Returns dictionary of estimated parameters.
-        """
-        return self._params

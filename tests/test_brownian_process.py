@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 from kestrel.diffusion.brownian import BrownianMotion, GeometricBrownianMotion
 from kestrel.utils.kestrel_result import KestrelResult
+from scipy.stats import norm
 
 
 @pytest.fixture
@@ -71,27 +72,67 @@ class TestBrownianMotion:
     def test_fit_mle(self, sample_brownian_data):
         """Test MLE fitting."""
         bm = BrownianMotion()
-        bm.fit(sample_brownian_data, method='mle')
+        result = bm.fit(sample_brownian_data, method='mle')
 
         assert bm.is_fitted
-        assert hasattr(bm, 'mu_')
-        assert hasattr(bm, 'sigma_')
-        assert bm.sigma_ > 0
+        assert result.params['mu'] is not None
+        assert result.params['sigma'] > 0
+        assert result.log_likelihood is not None
+        assert result.aic is not None
+        assert result.bic is not None
+        assert result.residuals is not None
+        assert len(result.residuals) == len(sample_brownian_data) - 1
+
+        # Check that the parameters are also stored on the model instance for sampling
+        assert bm.mu == result.params['mu']
+        assert bm.sigma == result.params['sigma']
 
     def test_fit_moments(self, sample_brownian_data):
         """Test moments fitting."""
         bm = BrownianMotion()
-        bm.fit(sample_brownian_data, method='moments')
+        result = bm.fit(sample_brownian_data, method='moments')
 
         assert bm.is_fitted
-        assert hasattr(bm, 'mu_')
-        assert hasattr(bm, 'sigma_')
-        assert bm.sigma_ > 0
+        assert result.params['mu'] is not None
+        assert result.params['sigma'] > 0
+        assert result.log_likelihood is not None
+        assert result.aic is not None
+        assert result.bic is not None
+        assert result.residuals is not None
+        assert len(result.residuals) == len(sample_brownian_data) - 1
+
+        # Check that the parameters are also stored on the model instance for sampling
+        assert bm.mu == result.params['mu']
+        assert bm.sigma == result.params['sigma']
+
+    def test_fit_gmm(self, sample_brownian_data):
+        """Test GMM fitting."""
+        true_mu, true_sigma, dt = 0.05, 0.2, 1/252
+        bm = BrownianMotion()
+        result = bm.fit(sample_brownian_data, dt=dt, method='gmm')
+
+        assert bm.is_fitted
+        assert result.params['mu'] is not None
+        assert result.params['sigma'] > 0
+        assert result.log_likelihood is not None
+        assert result.aic is not None
+        assert result.bic is not None
+        assert result.residuals is not None
+        assert len(result.residuals) == len(sample_brownian_data) - 1
+
+        # Check if estimated parameters are reasonably close to true parameters
+        assert np.isclose(result.params['mu'], true_mu, rtol=0.1, atol=0.01)
+        assert np.isclose(result.params['sigma'], true_sigma, rtol=0.1, atol=0.01)
+
+        # Check that the parameters are also stored on the model instance for sampling
+        assert bm.mu == result.params['mu']
+        assert bm.sigma == result.params['sigma']
+
 
     def test_sample_after_fit(self, sample_brownian_data):
         """Test sampling after fitting."""
         bm = BrownianMotion()
-        bm.fit(sample_brownian_data, method='mle')
+        bm.fit(sample_brownian_data, method='mle') # Fit method updates bm.mu, bm.sigma
 
         n_paths = 5
         horizon = 10
@@ -130,6 +171,27 @@ class TestBrownianMotion:
         with pytest.raises(ValueError, match="Unknown estimation method"):
             bm.fit(data, method='invalid')
 
+    def test_residuals_properties(self, sample_brownian_data):
+        """Test residuals and associated properties."""
+        bm = BrownianMotion()
+        result = bm.fit(sample_brownian_data)
+
+        assert result.residuals is not None
+        assert isinstance(result.residuals, pd.Series)
+        assert np.isclose(result.residuals.mean(), 0, atol=0.1) # Standardized residuals should have mean close to 0
+        assert np.isclose(result.residuals.std(), 1, atol=0.1)  # Standardized residuals should have std dev close to 1
+
+        lb_test_results = result.ljung_box()
+        assert lb_test_results is not None
+        assert isinstance(lb_test_results, pd.DataFrame)
+        assert 'lb_stat' in lb_test_results.columns
+
+        normality_test_results = result.normality_test()
+        assert normality_test_results is not None
+        assert 'statistic' in normality_test_results
+        assert 'p-value' in normality_test_results
+        # No easy assertion for Q-Q plot; just ensure it doesn't raise an error.
+        result.qq_plot()
 
 # GeometricBrownianMotion tests
 class TestGeometricBrownianMotion:
@@ -152,17 +214,25 @@ class TestGeometricBrownianMotion:
     def test_fit_mle(self, sample_gbm_data):
         """Test MLE fitting."""
         gbm = GeometricBrownianMotion()
-        gbm.fit(sample_gbm_data, method='mle')
+        result = gbm.fit(sample_gbm_data, method='mle')
 
         assert gbm.is_fitted
-        assert hasattr(gbm, 'mu_')
-        assert hasattr(gbm, 'sigma_')
-        assert gbm.sigma_ > 0
+        assert result.params['mu'] is not None
+        assert result.params['sigma'] > 0
+        assert result.log_likelihood is not None
+        assert result.aic is not None
+        assert result.bic is not None
+        assert result.residuals is not None
+        assert len(result.residuals) == len(sample_gbm_data) - 1
+
+        # Check that the parameters are also stored on the model instance for sampling
+        assert gbm.mu == result.params['mu']
+        assert gbm.sigma == result.params['sigma']
 
     def test_sample_after_fit(self, sample_gbm_data):
         """Test sampling after fitting."""
         gbm = GeometricBrownianMotion()
-        gbm.fit(sample_gbm_data, method='mle')
+        gbm.fit(sample_gbm_data, method='mle') # Fit method updates gbm.mu, gbm.sigma
 
         n_paths = 5
         horizon = 10
@@ -200,24 +270,45 @@ class TestGeometricBrownianMotion:
     def test_expected_price(self, sample_gbm_data):
         """Test expected price calculation."""
         gbm = GeometricBrownianMotion()
-        gbm.fit(sample_gbm_data, method='mle')
+        result = gbm.fit(sample_gbm_data, method='mle')
 
         s0 = 100.0
         t = 1.0
         expected = gbm.expected_price(t, s0)
 
         # E[S_t] = S_0 * exp(mu * t)
-        assert expected == pytest.approx(s0 * np.exp(gbm.mu_ * t), rel=1e-6)
+        assert expected == pytest.approx(result.params['mu'] * np.exp(result.params['mu'] * t), rel=1e-6)
 
     def test_variance_price(self, sample_gbm_data):
         """Test variance calculation."""
         gbm = GeometricBrownianMotion()
-        gbm.fit(sample_gbm_data, method='mle')
+        result = gbm.fit(sample_gbm_data, method='mle')
 
         s0 = 100.0
         t = 1.0
         variance = gbm.variance_price(t, s0)
 
         # Var[S_t] = S_0^2 * exp(2*mu*t) * (exp(sigma^2*t) - 1)
-        expected_var = (s0 ** 2) * np.exp(2 * gbm.mu_ * t) * (np.exp(gbm.sigma_ ** 2 * t) - 1)
+        expected_var = (s0 ** 2) * np.exp(2 * result.params['mu'] * t) * (np.exp(result.params['sigma'] ** 2 * t) - 1)
         assert variance == pytest.approx(expected_var, rel=1e-6)
+
+    def test_residuals_properties(self, sample_gbm_data):
+        """Test residuals and associated properties."""
+        gbm = GeometricBrownianMotion()
+        result = gbm.fit(sample_gbm_data)
+
+        assert result.residuals is not None
+        assert isinstance(result.residuals, pd.Series)
+        assert np.isclose(result.residuals.mean(), 0, atol=0.1)
+        assert np.isclose(result.residuals.std(), 1, atol=0.1)
+
+        lb_test_results = result.ljung_box()
+        assert lb_test_results is not None
+        assert isinstance(lb_test_results, pd.DataFrame)
+        assert 'lb_stat' in lb_test_results.columns
+
+        normality_test_results = result.normality_test()
+        assert normality_test_results is not None
+        assert 'statistic' in normality_test_results
+        assert 'p-value' in normality_test_results
+        result.qq_plot()

@@ -16,10 +16,10 @@ Robust parameter estimation for stochastic differential equations in Python.
 ## Key Features
 
 - **Analytic MLEs where they exist** — closed-form estimators for linear SDEs (BM, GBM, OU), numerical optimisation only when the model demands it (CIR, Merton)
-- **Standard errors on every parameter** — analytical Fisher information or delta-method standard errors, not just point estimates
-- **Consistent `fit()` / `sample()` API** — scikit-learn-style interface across all processes
-- **Automatic `dt` inference** — pass a `DatetimeIndex` and Kestrel converts to annualised time steps
-- **Fully typed and tested** — type annotations throughout, 74 tests covering parameter recovery, edge cases, and sampling moments
+- **Standard errors on every parameter**: analytical Fisher information or delta-method standard errors, not just point estimates
+- **Consistent `fit()` / `sample()` API**: scikit-learn-style interface across all processes
+- **Automatic `dt` inference**: pass a `DatetimeIndex` and Kestrel converts to annualised time steps
+- **Fully typed and tested**: type annotations throughout, 74 tests covering parameter recovery, edge cases, and sampling moments
 
 ## Installation
 

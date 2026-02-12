@@ -38,3 +38,4 @@ Thumbs.db
 
 # Lock files (not needed for libraries)
 uv.lock
+KESTREL_IMPROVEMENT_PLAN.md

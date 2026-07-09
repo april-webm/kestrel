@@ -389,7 +389,7 @@ class MertonProcess(StochasticProcess):
         return [mu_new, sigma_new, lambda_, jump_mu_new, jump_sigma_new]
 
 
-    def _neg_log_likelihood_vectorized(self, params: List[float], returns: np.ndarray, dt: float, reg: float = 0.0, only_nll: bool = False) -> Tuple[float, Optional[np.ndarray]]:
+    def _neg_log_likelihood_vectorized(self, params: List[float], returns: np.ndarray, dt: float, reg: float = 0.0, only_nll: bool = False) -> Any:
         """
         Negative log-likelihood for Merton model (vectorized).
 
@@ -404,6 +404,8 @@ class MertonProcess(StochasticProcess):
         mu, sigma, lambda_, jump_mu, jump_sigma = params
 
         if sigma <= 0 or lambda_ < 0 or jump_sigma <= 0:
+            if only_nll:
+                return np.inf
             return np.inf, None
 
         n = len(returns)
@@ -444,7 +446,7 @@ class MertonProcess(StochasticProcess):
             nll += reg * mu ** 2
         
         if only_nll:
-            return nll, None
+            return nll
         else:
             # Residuals are defined as log-likelihood contribution for each observation
             residuals = np.log(density_for_each_return)

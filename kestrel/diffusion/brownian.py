@@ -89,8 +89,8 @@ class BrownianMotion(StochasticProcess):
         else:
             raise ValueError(f"Unknown estimation method: {method}. Choose 'mle', 'moments', or 'gmm'.")
 
-        self.mu = mu  # Store on self for sample method if not passed explicitly
-        self.sigma = sigma # Store on self for sample method if not passed explicitly
+        self.mu = self.mu_ = mu  # Store on self for sample method if not passed explicitly
+        self.sigma = self.sigma_ = sigma # Store on self for sample method if not passed explicitly
 
         log_likelihood, residuals = self._calculate_bm_log_likelihood_and_residuals(data, dt, mu, sigma)
 
@@ -356,8 +356,8 @@ class GeometricBrownianMotion(StochasticProcess):
         else:
             raise ValueError(f"Unknown estimation method: {method}. Choose 'mle'.")
 
-        self.mu = mu # Store on self for sample method if not passed explicitly
-        self.sigma = sigma # Store on self for sample method if not passed explicitly
+        self.mu = self.mu_ = mu # Store on self for sample method if not passed explicitly
+        self.sigma = self.sigma_ = sigma # Store on self for sample method if not passed explicitly
 
         log_likelihood, residuals = self._calculate_gbm_log_likelihood_and_residuals(data, dt, mu, sigma)
 

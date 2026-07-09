@@ -217,13 +217,16 @@ class KestrelResult:
         plt.show()
 
     def __repr__(self) -> str:
+        log_likelihood = f"{self._log_likelihood:.2f}" if self._log_likelihood is not None else "N/A"
+        aic = f"{self._aic:.2f}" if self._aic is not None else "N/A"
+        bic = f"{self._bic:.2f}" if self._bic is not None else "N/A"
         return (
             f"KestrelResult(process_name={self._process_name}, "
             f"paths_shape={self._paths.shape if self._paths is not None else 'N/A'}, "
             f"initial_value={self._initial_value}, "
-            f"log_likelihood={self._log_likelihood:.2f} if self._log_likelihood is not None else 'N/A', "
-            f"aic={self._aic:.2f} if self._aic is not None else 'N/A', "
-            f"bic={self._bic:.2f} if self._bic is not None else 'N/A')"
+            f"log_likelihood={log_likelihood}, "
+            f"aic={aic}, "
+            f"bic={bic})"
         )
 
     def __str__(self) -> str:

@@ -48,6 +48,7 @@ def simple_returns_data():
     n = 200
     normal_returns = np.random.normal(0, 0.01, int(n * 0.9))
     jump_returns = np.random.normal(-0.03, 0.02, int(n * 0.1))
+    returns = np.concatenate([normal_returns, jump_returns])
     np.random.shuffle(returns)
     return pd.Series(returns)
 

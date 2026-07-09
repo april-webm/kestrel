@@ -277,7 +277,7 @@ class TestGeometricBrownianMotion:
         expected = gbm.expected_price(t, s0)
 
         # E[S_t] = S_0 * exp(mu * t)
-        assert expected == pytest.approx(result.params['mu'] * np.exp(result.params['mu'] * t), rel=1e-6)
+        assert expected == pytest.approx(s0 * np.exp(result.params['mu'] * t), rel=1e-6)
 
     def test_variance_price(self, sample_gbm_data):
         """Test variance calculation."""

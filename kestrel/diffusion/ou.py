@@ -96,9 +96,9 @@ class OUProcess(StochasticProcess):
         else:
             raise ValueError(f"Unknown estimation method: {method}. Choose 'mle', 'ar1', or 'kalman'.")
 
-        self.theta = theta # Store on self for sample method if not passed explicitly
-        self.mu = mu
-        self.sigma = sigma
+        self.theta = self.theta_ = theta # Store on self for sample method if not passed explicitly
+        self.mu = self.mu_ = mu
+        self.sigma = self.sigma_ = sigma
 
         self._post_fit_setup(
             last_data_point=data.iloc[-1],

@@ -125,9 +125,9 @@ class CIRProcess(StochasticProcess):
         else:
             raise ValueError(f"Unknown estimation method: {method}. Choose 'mle' or 'lsq'.")
 
-        self.kappa = kappa # Store on self for sample method if not passed explicitly
-        self.theta = theta
-        self.sigma = sigma
+        self.kappa = self.kappa_ = kappa # Store on self for sample method if not passed explicitly
+        self.theta = self.theta_ = theta
+        self.sigma = self.sigma_ = sigma
 
         self._post_fit_setup(
             last_data_point=data.iloc[-1],
@@ -231,7 +231,7 @@ class CIRProcess(StochasticProcess):
         param_ses = self._compute_standard_errors(result, ['kappa', 'theta', 'sigma'])
         return kappa, theta, sigma, param_ses, log_likelihood, residuals
 
-    def _neg_log_likelihood_and_residuals(self, params: List[float], x: np.ndarray, dt: float, reg: float = 0.0, only_nll: bool = False) -> Tuple[float, Optional[np.ndarray]]:
+    def _neg_log_likelihood_and_residuals(self, params: List[float], x: np.ndarray, dt: float, reg: float = 0.0, only_nll: bool = False) -> Any:
         """
         Negative log-likelihood for CIR using Gaussian approximation.
 
@@ -243,6 +243,8 @@ class CIRProcess(StochasticProcess):
         kappa, theta, sigma = params
 
         if kappa <= 0 or theta <= 0 or sigma <= 0:
+            if only_nll:
+                return np.inf
             return np.inf, None
 
         n = len(x)
@@ -282,7 +284,7 @@ class CIRProcess(StochasticProcess):
             nll += reg * (kappa ** 2 + theta ** 2)
         
         if only_nll:
-            return nll, None
+            return nll
         else:
             return nll, np.array(residuals_list)
 
